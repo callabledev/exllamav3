@@ -1,7 +1,6 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
-
 from ..model.config import Config, no_default
 from ..model.model import Model
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP
@@ -42,8 +41,7 @@ class PPLXQwen3Config(Config):
         # Layers
         self.num_hidden_layers = self.read_cfg(int, "num_hidden_layers", no_default)
 
-        # PPLX embedding checkpoints use Qwen3 blocks with bidirectional
-        # self-attention and no language-modeling head.
+        # PPLX embedding checkpoints use Qwen3 text blocks with bidirectional attention.
         self.use_bidirectional_attention = self.read_cfg(bool, "use_bidirectional_attention", True)
         self.assert_cfg(bool, "use_cache", False, True)
 
@@ -61,6 +59,7 @@ class PPLXQwen3Model(Model):
     ):
         super().__init__(config, **kwargs)
 
+        # Tensor keys are unprefixed in PPLX checkpoints: embed_tokens, layers.*, norm.
         self.modules += [
             Embedding(
                 config = config,
@@ -142,14 +141,13 @@ class PPLXQwen3Model(Model):
             )
         ]
 
-        # No logit layer: forward() returns final token hidden states.
+        # No lm_head: forward() returns final hidden states for embedding pooling.
         self.caps.update({"mrope": True})
         self.g_rope = RoPE("cpu", config.rope_settings)
 
 
     @override
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
-        params.setdefault("attn_mode", "flash_attn_nc")
         params.setdefault("causal", not self.config.use_bidirectional_attention)
         input_ids = prepare_for_attn(input_ids, params)
         return input_ids
