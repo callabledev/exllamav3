@@ -30,6 +30,7 @@ from .nanochat import NanoChatModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
 from .phi3 import Phi3Model
+from .pplx_qwen3 import PPLXQwen3Model
 from .qwen2 import Qwen2Model
 from .qwen2_5_vl import Qwen2_5VLModel
 from .qwen3 import Qwen3Model
@@ -82,6 +83,7 @@ ARCHITECTURES = {
         Olmo3Model,
         OlmoHybridModel,
         Phi3Model,
+        PPLXQwen3Model,
         Qwen2Model,
         Qwen2_5VLModel,
         Qwen3Model,
