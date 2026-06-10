@@ -100,7 +100,9 @@ except ModuleNotFoundError:
 
 try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-except ModuleNotFoundError:
+except (ImportError, RuntimeError):
+    # FLA/Triton may be installed but unusable in driverless build/test
+    # containers. Treat it as an optional accelerator and use local fallbacks.
     chunk_gated_delta_rule = None
 
 """
