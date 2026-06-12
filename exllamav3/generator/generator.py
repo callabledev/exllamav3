@@ -34,6 +34,7 @@ class Generator:
         enable_defrag: bool = True,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
+        recurrent_checkpoint_interval_pp: int = 32768,
         ngram_match_min: int = 0,
         **kwargs
     ):
@@ -87,8 +88,12 @@ class Generator:
             Ignored if model doesn't use recurrent states
 
         :param recurrent_checkpoint_interval:
-            Minimum number of tokens between recurrent checkpoints. Must be a multiple of the page size.
-            Model architecture determines default
+            Minimum number of tokens between recurrent checkpoints in model output and the tail end of
+            the prompt. Must be a multiple of the page size. Model architecture determines default
+
+        :param recurrent_checkpoint_interval_pp]:
+            Minimum number of tokens between recurrent checkpoints during prompt ingestion. Must be a
+            multiple of the page size. Default is 32768 tokens
 
         :param kwargs:
         """
@@ -166,20 +171,26 @@ class Generator:
         self.recurrent_cache_size = recurrent_cache_size
         if self.model.caps.get("recurrent_states"):
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
+            # Limit batch size if cache has recurrent states
+            self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
             self.recurrent_cache = None
         if recurrent_checkpoint_interval is None:
             recurrent_checkpoint_interval = model.caps.get("default_recurrent_checkpoint_interval", 2048)
 
-        assert recurrent_checkpoint_interval % PAGE_SIZE == 0, \
-            "recurrent_checkpoint_interval must be a multiple of the page size (256)"
-        recurrent_checkpoint_interval = min(recurrent_checkpoint_interval, self.max_chunk_size)
+        assert recurrent_checkpoint_interval % PAGE_SIZE == 0 and recurrent_checkpoint_interval % PAGE_SIZE == 0, \
+            "checkpoint interval must be a multiple of the page size (256)"
+        def ceil_span(a, b):
+            return (a + b - 1) // b * b
+        recurrent_checkpoint_interval = recurrent_checkpoint_interval
         self.recurrent_checkpoint_interval = recurrent_checkpoint_interval
+        self.recurrent_checkpoint_interval_pp = ceil_span(recurrent_checkpoint_interval_pp, self.max_chunk_size)
 
         # Drafting mode
         if draft_model is not None and draft_model.caps.get("attach_target"):
             draft_model.attach_to(model)
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
+        self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
 
 
     def num_remaining_jobs(self):
@@ -213,6 +224,13 @@ class Generator:
         """
         Adds a job or list of jobs to the queue.
 
+        Each job is prepared against this generator before it is appended to the pending queue. Preparation assigns
+        the current job_serial, hashes prompt pages for later cache lookup, and validates that the request can fit
+        the configured cache and batch limits. The serial is then incremented and returned to the caller; it is also
+        included in started, prefill and streaming result dictionaries so clients can correlate events with the
+        logical request. Requeued jobs keep their original serial number internally so a long generation still
+        appears as one stream.
+
         returns:
             int: (List of) unique serial number(s) for job(s)
         """
@@ -234,7 +252,12 @@ class Generator:
         job: Job
     ):
         """
-        Cancel single job
+        Cancel a single pending or active job.
+
+        Pending jobs are removed before they ever allocate cache pages. Active jobs first release their page
+        references and recurrent state, then leave active_jobs so future iterations stop sampling them. If the
+        cancellation drains the generator completely, the page table is defragmented immediately because no active
+        block tables still depend on the current physical page ordering.
         """
 
         num_jobs = self.num_remaining_jobs()
@@ -330,6 +353,9 @@ class Generator:
             if self.dflash_draft:
                 draft_tokens = self.iterate_draftmodel_dflash_gen(results)
                 self.iterate_gen(results, draft_tokens)
+            elif self.mtp_draft:
+                draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+                self.iterate_gen(results, draft_tokens)
             else:
                 draft_tokens = self.iterate_draftmodel_gen(results)
                 self.iterate_gen(results, draft_tokens)
@@ -353,7 +379,7 @@ class Generator:
 
     def recurrent_checkpoint(self):
         for job in self.active_jobs:
-            job.maybe_stash_recurrent(self.recurrent_cache, self.recurrent_checkpoint_interval)
+            job.maybe_stash_recurrent(self.recurrent_cache)
 
 
     def update_visualizer(self):
@@ -437,6 +463,72 @@ class Generator:
                 "cache_seqlens": cache_seqlens
             }
         )
+
+        return self.draft_ids_pinned
+
+
+    def iterate_draftmodel_mtp_gen(self, results: list):
+
+        # Get shape of active batch
+        batch_size = 0
+        max_seq_len = 0
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            max_seq_len = max(max_seq_len, job.get_max_seq_len() + self.num_draft_tokens + 1)
+            batch_size += 1
+        if batch_size == 0:
+            return None
+
+        # Create block index table for batch
+        max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+        block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
+        cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
+        batch = 0
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            for seq in job.sequences:
+                seq_block_index = seq.block_index_tensor[:, :max_pages_batch]
+                block_index[batch:batch+1, :seq_block_index.shape[-1]].copy_(seq_block_index)
+                cache_seqlens[batch] = seq.kv_position
+                batch += 1
+
+        # Collect input IDs
+        input_ids_list = []
+        mtp_hidden_list = []
+        for job in self.active_jobs:
+            if not job.is_prefill_done(): continue
+            assert len(job.sequences) == 1, "Qwen3.5 MTP drafting does not currently support CFG/multi-sequence jobs"
+            if job.mtp_last_hidden is None:
+                # A one-token prompt has no token to prefill before the generation input.
+                # Run one normal target step first; iterate_gen() will initialize MTP state.
+                return None
+            if job.time_first_token is None:
+                cuda_sync_active()
+                job.time_first_token = time.time()
+            job_ids = job.get_input_ids_list()
+            input_ids_list += job_ids
+            mtp_hidden_list.append(job.mtp_last_hidden)
+        batch_ids = self.draft_input_ids_pinned[:batch_size, :]
+        batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
+        temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
+
+        # Greedy sample num_draft_tokens batched tokens
+        for idx in range(self.num_draft_tokens):
+            params = {
+                "target_hidden": temp_hidden,
+                "attn_mode": "flash_attn",
+                "block_table": block_index,
+                "cache": self.draft_cache,
+                "cache_seqlens": cache_seqlens,
+            }
+            batch_state = self.draft_model.forward(batch_ids, params)
+            batch_logits = self.model.modules[self.model.logit_layer_idx].forward(batch_state, params)
+            new_ids = torch.argmax(batch_logits, dim = -1)
+            self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
+            batch_ids.copy_(new_ids)
+            cache_seqlens += 1
+            temp_hidden = batch_state
+
 
         return self.draft_ids_pinned
 
@@ -533,6 +625,8 @@ class Generator:
     def iterate_gen(self, results: list, draft_tokens: torch.Tensor | None = None):
 
         # Get shape of active batch
+        # Only jobs that have finished prefill can participate in token generation. The maximum sequence length
+        # determines how many cache pages the temporary block table needs for this iteration.
         batch_size = 0
         max_seq_len = 0
         for job in self.active_jobs:
@@ -545,6 +639,8 @@ class Generator:
             max_seq_len += draft_tokens.shape[-1]
 
         # Create block index table for batch
+        # The model sees a compact batch, so build per-row mappings from logical page positions to physical cache
+        # page indices, along with current cache lengths and optional MRoPE position offsets.
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
         block_index = torch.zeros((batch_size, max_pages_batch), dtype = torch.int32)
         cache_seqlens = torch.zeros((batch_size,), dtype = torch.int32)
@@ -562,6 +658,8 @@ class Generator:
                 batch += 1
 
         # Collect input IDs and indexed embeddings
+        # Jobs may contribute multiple sequence rows. logit_mapping records the slice of the model output that
+        # belongs to each active job, while batch_jobs keeps the corresponding Job objects in compact-batch order.
         input_ids_list = []
         active_embeddings = []
         logit_mapping = []
@@ -580,15 +678,11 @@ class Generator:
         batch_ids = torch.cat(input_ids_list, dim = 0)
 
         # Collect recurrent states for batch
-        # TODO: Figure out a way to minimize redundant batching and unbatching
-        states, batch_states = None, None
+        # Recurrent models carry mutable state beside the K/V cache; pass one state object per compact batch job so
+        # the model can advance or rewind it consistently with accepted draft tokens.
+        batch_states = None
         if self.recurrent_cache is not None:
-            if batch_size == 1:
-                states = [batch_jobs[0].recurrent_state]
-                batch_states = batch_jobs[0].recurrent_state
-            else:
-                states = [job.recurrent_state for job in batch_jobs]
-                batch_states = {key: states[0][key].collect_batch([s[key] for s in states]) for key in states[0].keys()}
+            batch_states = [job.recurrent_state for job in batch_jobs]
 
         # GPU workload is scheduled here, so launch any sampling filters that can run in the background
         for job in batch_jobs:
@@ -601,7 +695,8 @@ class Generator:
                 else:
                     job.filter_futures.append(None)
 
-        # Get logit batch from model
+        # Get logit batch from model. Forward writes new K/V entries into the cache for the supplied positions and
+        # returns logits for either one target token or a target-plus-draft verification window.
         params = {
             "attn_mode": "flash_attn",
             "block_table": block_index,
@@ -612,19 +707,21 @@ class Generator:
             "positions": positions,
             "recurrent_history": draft_tokens is not None,
         }
+        if self.draft_model:
+            params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(
             input_ids = batch_ids,
             params = params,
         )
 
-        # Split batched recurrent states
-        if self.recurrent_cache is not None:
-            if batch_size > 1:
-                for key, v in batch_states.items():
-                    v.distribute_batch([s[key] for s in states])
-                del batch_states
+        # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
+        # references to recurrent state objects past this iteration.
+        p_export_states = params.get("export_states")
+        p_cache_seqlens = params.get("cache_seqlens")
+        params = None
 
-        # Run foreground filters here, while GPU workload is queued up and running
+        # Background filters were launched before forward(); synchronous filters run now to overlap CPU work with
+        # queued GPU execution as much as possible.
         for job in batch_jobs:
             if job.new_tokens < 0: continue
             assert len(job.logit_masks) == 0
@@ -642,9 +739,12 @@ class Generator:
 
         # TODO: Batch sampling
         # Pass to jobs to sample
+        # Sampling is still job-by-job. Each accepted token updates job state, may emit a stream result, may finish
+        # the job, or may request requeueing once the configured per-job token budget is reached.
         completed_jobs = []
         requeuing_jobs = []
         accepted_lengths = []
+        rejected = 0
         j = 0
         for idx, (job, a, b) in enumerate(zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:])):
             if a == b: continue
@@ -665,29 +765,36 @@ class Generator:
                     results,
                 )
 
-                # Requeue
+                # Requeue. Requeueing is only supported for single-sequence jobs because the replacement job uses the
+                # full sequence generated so far as its next prompt.
                 if len(job.sequences) == 1 and rq:
+                    # if draft_tokens is not None:
+                    #     rejected = batch_logits.shape[1] - 1 - i
+                    #     batch_states[j].rewind(rejected)
                     requeuing_jobs.append(job)
                     break
 
-                # EOS
+                # EOS. Stop sampling this job immediately once a stop condition, filter condition or max token limit
+                # produces an EOS event.
                 if eos:
                     completed_jobs.append(job)
                     break
 
-                # Continue sampling from logit batch as long as result matches draft
+                # Continue sampling from logit batch as long as result matches draft, unless hitting checkpoint mark.
+                # For speculative decoding, consume additional logits only while the sampled target token matches
+                # the draft token. A recurrent checkpoint boundary also stops draft acceptance so state can be
+                # stashed at an exact page boundary.
                 if draft_tokens is not None and i < batch_logits.shape[1] - 1:
-                    if draft_tokens[j, i].item() != sampled_token.item():
+                    cp_boundary = batch_states is not None and job.is_checkpoint_boundary()
+                    if draft_tokens[j, i].item() != sampled_token.item() or cp_boundary:
 
                         # Count rejected draft tokens
                         rejected = batch_logits.shape[1] - 1 - i
                         job.rejected_draft_tokens += rejected
 
                         # Rewind recurrent states
-                        if rejected and states:
-                            for layer, state in states[idx].items():
-                                assert len(job.sequences) == 1
-                                state.rewind(rejected)
+                        if batch_states is not None:
+                            batch_states[j].rewind(rejected)
 
                         # Rewind cache position (draft model cache layout is always the same as target)
                         for seq in job.sequences:
@@ -718,41 +825,87 @@ class Generator:
                         job.prepare_logit_mask()
                         job.prepare_sampling_past_ids()
 
-            j += 1
-            accepted_lengths.append(accepted_length)
+            # Make sure outgoing state is valid if entire draft was accepted
+            if batch_states and draft_tokens is not None and rejected == 0:
+                batch_states[j].rewind(0)
 
-        # Accept new target_hidden if DFlash
+            accepted_lengths.append(accepted_length)
+            j += 1
+
+        # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
+        # states for the tokens accepted above, keeping draft and target cache layouts aligned.
         if self.dflash_draft:
             self.draft_model.update_kv_from_target(
-                target_hidden = params.get("export_states"),
+                target_hidden = p_export_states,
                 cache = self.draft_cache,
                 lengths = accepted_lengths,
                 params = {
                     "block_table": block_index,
-                    "cache_seqlens": params["cache_seqlens"],
+                    "cache_seqlens": p_cache_seqlens,
                 }
             )
 
-        # Release pages for completed jobs
+        # Accept new target_hidden if MTP. MTP draft models can update their cache from target-model hidden
+        # states for the tokens accepted above, keeping draft and target cache layouts aligned.
+        if self.mtp_draft:
+            target_hidden = p_export_states[-1]
+            accepted_idx = 0
+            for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+                if a_idx == b_idx:
+                    continue
+                accepted_length = accepted_lengths[accepted_idx]
+                accepted_idx += 1
+
+                # Position K was drafted from the last target state already. Replace accepted
+                # speculative positions K+1..K+A-1 with the corresponding target-state inputs.
+                if accepted_length > 1:
+                    self.draft_model.prefill(
+                        batch_ids[a_idx:b_idx, 1:accepted_length],
+                        {
+                            "attn_mode": "flash_attn",
+                            "block_table": block_index[a_idx:b_idx],
+                            "cache": self.draft_cache,
+                            "cache_seqlens": p_cache_seqlens[a_idx:b_idx] + 1,
+                            "target_hidden": target_hidden[a_idx:b_idx, :accepted_length - 1, :],
+                        },
+                    )
+
+                # The next unprocessed token is paired with the preceding target hidden state.
+                job.mtp_last_hidden = target_hidden[
+                    a_idx:b_idx, accepted_length - 1:accepted_length, :
+                ].clone()
+
+        # Release pages for completed jobs. Finished and requeued jobs no longer need their active page references.
+        # Requeued recurrent jobs may stash the last checkpoint first so the next queued job can resume from cached
+        # recurrent state.
         num_jobs = self.num_remaining_jobs()
         for job in completed_jobs + requeuing_jobs:
             if job in requeuing_jobs and self.recurrent_cache is not None:
-                job.maybe_stash_recurrent(self.recurrent_cache, self.recurrent_checkpoint_interval)
+                job.maybe_stash_recurrent(self.recurrent_cache, PAGE_SIZE)
             job.deallocate_pages()
-            job.free_recurrent_state()
             self.active_jobs.remove(job)
 
-        # Requeue jobs
+        # Requeue jobs. Puts replacement jobs at the front so long generations continue promptly after they yield
+        # their cache pages.
         for job in requeuing_jobs:
             rq_job = job.prepare_for_requeue()
             self.pending_jobs.insert(0, rq_job)
 
-        # Defrag
+        # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs():
             self.pagetable.defrag()
 
 
     def iterate_start_jobs(self, results: list):
+        """
+        Move pending jobs into the active set when batch and cache capacity allow.
+
+        Jobs are considered in queue order, but a job can be skipped temporarily if it would exceed max_batch_size
+        or needs more fresh pages than are currently unreferenced. Later jobs may start if they fit, which improves
+        utilization, but each skipped job accumulates a skip count; once any skipped job reaches max_skips, startup
+        stops for this iteration to preserve approximate queue fairness. Started jobs allocate their cache pages
+        immediately and emit a "started" event.
+        """
 
         # Get current max batch
         current_max_batch = 0

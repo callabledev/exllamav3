@@ -8,6 +8,7 @@ from ..util.memory import free_mem
 from .model_tp import Model_TPMixin
 from .model_ls import Model_LSMixin
 from ..util.tensor import g_tensor_cache
+from ..cache.recurrent_util import advance_recurrent_states
 
 class Model(Model_TPMixin, Model_LSMixin):
 
@@ -27,6 +28,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.active_devices = []
         self.output_device = None
         self.cache_weakrefs = {}
+        self.recurrent_state_cls = None
+        self.draft_verifier_params = {}
 
         # Index of last layer that affects KV cache, used during prefill
         self.last_kv_module_idx = None
@@ -181,24 +184,48 @@ class Model(Model_TPMixin, Model_LSMixin):
 
     @torch.inference_mode
     def prefill(self, input_ids: torch.Tensor, params: dict | None = None):
+        """
+        Run prompt-prefill inference and update cache/recurrent state.
+
+        Inputs are first normalized by the architecture-specific prepare_inputs() hook. If the model is loaded in
+        tensor-parallel mode, execution is dispatched through prefill_tp(), which fans the work out to TP workers
+        and stops at the last module that affects K/V cache state. Otherwise the layer-split path prefill_ls() runs
+        directly in the current process. Both paths advance recurrent states after the forward work completes.
+        """
         if params is None:
             params = {}
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
-            return self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
+            y = self.prefill_tp(x, params, self.last_kv_module_idx, self.modules)
+            advance_recurrent_states(input_ids, params, self)
+            return y
         else:
-            return self.prefill_ls(x, params)
+            y = self.prefill_ls(x, params)
+            advance_recurrent_states(input_ids, params, self)
+            return y
 
 
     @torch.inference_mode
     def forward(self, input_ids: torch.Tensor, params: dict | None = None):
+        """
+        Run a normal model forward pass for generation or verification.
+
+        After architecture-specific input preparation, tensor-parallel models dispatch through forward_tp() so each
+        worker processes its shard and gathers outputs as needed. Non-TP models use the local layer-split forward
+        path forward_ls(). Recurrent state advancement is shared between the two modes and runs after the selected
+        forward path returns.
+        """
         if params is None:
             params = {}
         x = self.prepare_inputs(input_ids, params)
         if self.loaded_tp:
-            return self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
+            y = self.forward_tp(x, params, self.last_kv_module_idx, self.modules)
+            advance_recurrent_states(input_ids, params, self)
+            return y
         else:
-            return self.forward_ls(x, params)
+            y = self.forward_ls(x, params)
+            advance_recurrent_states(input_ids, params, self)
+            return y
 
 
     def unload(self):
@@ -227,6 +254,7 @@ class Model(Model_TPMixin, Model_LSMixin):
         verbose: bool = False,
         max_batch_size: int = 1,
         tp_options: dict | None = None,
+        autosplit_no_forward: bool = False,
     ):
         """
         Load model, generator function. For regular function, call load() with the same arguments
@@ -313,6 +341,9 @@ class Model(Model_TPMixin, Model_LSMixin):
         :param tp_options:
             dict of optional values:
                 "moe_tensor_split": bool - use tensor split rather than expert parallelism for MoE layers
+
+        :param autosplit_no_forward:
+            For debug purposes, skip reference forward pass during autosplit load.
         """
 
         free_mem()
@@ -382,7 +413,8 @@ class Model(Model_TPMixin, Model_LSMixin):
                     self.modules,
                     verbose,
                     max_batch_size,
-                    self.cache_weakrefs
+                    self.cache_weakrefs,
+                    autosplit_no_forward,
                 )
                 self.output_device = self.modules[-1].device
 
@@ -558,18 +590,3 @@ class Model(Model_TPMixin, Model_LSMixin):
         Decide if any model-specific requirements are met when creating Model
         """
         pass
-
-    def get_empty_state(self, initial_length: int = 0):
-        """
-        Create an empty recurrent state. initial_length > 0 is for testing/benchmark purposes
-        """
-        if "recurrent_states" not in self.caps:
-            return None
-        new_state = {}
-        for m in self.get_recurrent_layers():
-            for i in self.get_layer_instances(m.layer_idx):
-                s = m.new_recurrent_state()
-                if initial_length:
-                    s.force_position(initial_length)
-                new_state[i] = s
-        return new_state

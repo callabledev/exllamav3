@@ -11,7 +11,7 @@ from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache
-from .attention import attn_dispatch
+from .attention_fn import attn_dispatch
 
 """
                    
@@ -140,11 +140,13 @@ class Attention(Module):
         interleaved_gate: bool = False,
         ve_gate: bool = False,
         use_k_as_v: bool = False,
+        transpose_qkv: bool = True,
         use_cu_seqlens: bool = False,
         post_rope_norm: bool = False,
         full_gate: bool = False,
         tp_split_norm: bool = True,
         select_hq_bits: int = 0,
+        qbits_key: str = "bits"
     ):
         super().__init__(config, key, None)
 
@@ -190,7 +192,7 @@ class Attention(Module):
             f = 2 if interleaved_gate else 1
             self.q_proj = Linear(
                 config,
-                f"{key}.{key_q}",
+                f"{key}.{key_q}" if key_q else f"{key}.q_proj",
                 hidden_size,
                 num_q_heads * head_dim * f,
                 qmap = qmap + ".input" if qmap is not None else None,
@@ -198,6 +200,8 @@ class Attention(Module):
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.q_proj)
         else:
@@ -209,7 +213,7 @@ class Attention(Module):
             assert key_v or frange_v or use_k_as_v
             self.k_proj = Linear(
                 config,
-                f"{key}.{key_k}",
+                f"{key}.{key_k}" if key_k else f"{key}.k_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -217,10 +221,12 @@ class Attention(Module):
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
+                qbits_key = qbits_key,
             )
             self.v_proj = Linear(
                 config,
-                f"{key}.{key_v}",
+                f"{key}.{key_v}" if key_v else f"{key}.v_proj",
                 hidden_size,
                 num_kv_heads * head_dim,
                 qmap =  qmap + ".input" if qmap is not None else None,
@@ -228,6 +234,8 @@ class Attention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                ftranspose_after_load = transpose_qkv,
+                qbits_key = qbits_key,
             ) if not use_k_as_v else None
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
@@ -253,6 +261,7 @@ class Attention(Module):
                 out_dtype = out_dtype,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".o" if qmap is not None else None,
+                qbits_key = qbits_key,
             )
             self.register_submodule(self.o_proj)
         else:
@@ -302,6 +311,7 @@ class Attention(Module):
                 out_dtype = torch.half,
                 pad_to = 1,
                 select_hq_bits = select_hq_bits,
+                qbits_key = qbits_key,
             )
             self.headwise_gate = not full_gate
             self.register_submodule(self.g_proj)
@@ -824,7 +834,8 @@ class Attention(Module):
                 "logit_softcapping": self.logit_softcapping,
                 "post_rope_norm": self.post_rope_norm,
                 "tp_split_norm": self.tp_split_norm,
-                "use_k_as_v": self.use_k_as_v
+                "use_k_as_v": self.use_k_as_v,
+                "interleaved_gate": self.interleaved_gate,
             },
             "num_kv_heads": self.num_kv_heads,
             **{name: _export(getattr(self, name, None)) for name in (
@@ -852,6 +863,7 @@ class Attention(Module):
     @staticmethod
     def tp_import(local_context, exported, plan, **kwargs):
         key = exported["kwargs"]["key"]
+        interleaved_gate = exported["kwargs"]["interleaved_gate"]
         head_dim = exported["kwargs"]["head_dim"]
         n_gqa = exported["n_gqa"]
         device = local_context["device"]
@@ -863,6 +875,8 @@ class Attention(Module):
 
         q_split = (True, first * head_dim * n_gqa, last * head_dim * n_gqa) \
             if num_kv_heads else None
+        if interleaved_gate and num_kv_heads:
+            q_split = q_split[0], q_split[1] * 2, q_split[2] * 2
         qh_split = (True, first * n_gqa, last * n_gqa) \
             if num_kv_heads else None
         kv_split = (True, first * head_dim, last * head_dim) \

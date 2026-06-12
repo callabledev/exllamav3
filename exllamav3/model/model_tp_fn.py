@@ -1,11 +1,40 @@
 import torch
 import traceback
+import os
+import sys
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
 from .model_tp_backend import TPBackendNCCL, TPBackendNative
 from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
+
+
+def install_parent_death_signal() -> bool:
+    """
+    On Linux, ask the kernel to terminate this worker if its direct parent dies.
+    This is a best-effort safety net for cases where Python shutdown hooks do not
+    get a chance to clean up spawned TP workers.
+    """
+    if sys.platform != "linux":
+        return False
+
+    import ctypes
+    import signal
+
+    PR_SET_PDEATHSIG = 1
+    parent_pid = os.getppid()
+
+    libc = ctypes.CDLL("libc.so.6", use_errno = True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0:
+        return False
+
+    # Race check: the parent may have exited before PDEATHSIG was installed.
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    return True
+
 
 def init_pg(device: int, active_devices: list[int], output_device: int, backend_args: dict, master: bool = False):
     rank = active_devices.index(device) if device >= 0 else -1
@@ -15,6 +44,8 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
         "device": device,
         "modules": [],
         "kv_modules": [],
+        "recurrent_modules": [],
+        "recurrent_cache": {},
         "rank": rank,
         "world_size": world_size,
         "output_rank": output_rank,
@@ -62,6 +93,8 @@ def mp_model_worker(
 ):
     set_t0("TP", dbg_t0_)
     log_tp(device, f"Child process launched")
+    if install_parent_death_signal():
+        log_tp(device, f"Installed parent death signal")
 
     with torch.inference_mode():
         local_context = init_pg(device, active_devices, output_device, backend_args)
@@ -128,6 +161,7 @@ def mp_model_append(local_context: dict, exported: dict):
     """
     modules = local_context["modules"]
     kv_modules = local_context["kv_modules"]
+    recurrent_modules = local_context["recurrent_modules"]
     device = local_context["device"]
     cls = exported["cls"]
     plan = local_context["plan"]
@@ -135,6 +169,9 @@ def mp_model_append(local_context: dict, exported: dict):
     module = cls.tp_import(local_context, exported, plan[device])
     modules.append(module)
     kv_modules += module.all_cache_modules()
+    recurrent_modules += module.all_recurrent_modules()
+    if module.caps.get("logits_output"):
+        local_context["logits_module"] = module
     return None
 
 
@@ -177,6 +214,7 @@ def mp_model_forward(
     params: dict,
     last_kv_module_idx: int,
     prefill: bool,
+    single_idx: int,
 ):
     """
     Forward pass for parallel slice of a model
@@ -184,7 +222,7 @@ def mp_model_forward(
     backend = local_context["backend"]
     backend.fwd_barrier()
 
-    modules = local_context["modules"]
+    modules = local_context["modules"] if single_idx is None else [local_context["modules"][single_idx]]
     consumer = local_context["inf_consumer"]
 
     for tensor_param in [
@@ -220,6 +258,88 @@ def mp_model_forward(
 
     backend.end_cpu_reduce_jobs()
     return x
+
+
+def mp_model_forward_embedding(
+    local_context: dict,
+    shared_input: dict,
+    params: dict,
+):
+    consumer = local_context["inf_consumer"]
+    module = local_context["modules"][0]
+    x = consumer.recv(shared_input)
+    x = module.forward(x, params)
+    return x
+
+
+def mp_model_forward_lm_head_argmax(
+    local_context: dict,
+    shared_input: dict,
+    params: dict,
+    offset: int,
+    gather_devices: list[int] | None,
+    ldims: list[int] | None,
+):
+    consumer = local_context["inf_consumer"]
+    device = local_context["device"]
+    output_device = local_context["output_device"]
+    backend = local_context["backend"]
+
+    x = consumer.recv(shared_input)
+
+    if offset >= 0:
+        module = local_context["logits_module"]
+        x = module.prepare_for_device(x, params)
+        x = module.forward(x, params)
+        v, i = x.max(dim = -1)
+        i += offset
+    else:
+        v = torch.empty(*x.shape[:-1], dtype = x.dtype, device = x.device)
+        i = torch.empty(*x.shape[:-1], dtype = torch.long, device = x.device)
+
+    if gather_devices is None:
+        return v, i
+
+    v_dim = 1 if offset >= 0 else 0
+    i_dim = 1 if offset >= 0 else 0
+    vp = torch.empty(*v.shape, v_dim, dtype = v.dtype, device = v.device)
+    ip = torch.empty(*i.shape, i_dim, dtype = i.dtype, device = i.device)
+    if offset >= 0:
+        vp[..., 0] = v
+        ip[..., 0] = i
+
+    if device == output_device:
+        out_v_shape = list(vp.shape)
+        out_i_shape = list(ip.shape)
+        out_v_shape[-1] = sum(ldims)
+        out_i_shape[-1] = sum(ldims)
+        out_v = torch.empty(*out_v_shape, dtype = vp.dtype, device = vp.device)
+        out_i = torch.empty(*out_i_shape, dtype = ip.dtype, device = ip.device)
+    else:
+        out_v = None
+        out_i = None
+
+    backend.gather_small(vp, out_v, gather_devices, output_device, ldims)
+    backend.gather_small(ip, out_i, gather_devices, output_device, ldims)
+
+    return (out_v, out_i) if device == output_device else None
+
+
+# def mp_model_forward_lm_head_argmax_old(
+#     local_context: dict,
+#     shared_input: dict,
+#     params: dict,
+#     offset: int
+# ):
+#     consumer = local_context["inf_consumer"]
+#     module = local_context["logits_module"]
+#
+#     x = consumer.recv(shared_input)
+#     x = module.prepare_for_device(x, params)
+#     x = module.forward(x, params)
+#     v, i = x.max(dim = -1)
+#     i += offset
+#     return v, i
 
 
 def mp_cache_page_copy(
@@ -266,6 +386,10 @@ class PseudoParentConn:
     Standin for a Pipe to dispatch functions on the main device rather than a dedicated child process running
     `mp_model_worker`. This allows a tensor-parallel model to run partially in the main process, without additional
     IPC overhead when returning logits from forward(), and without needing two CUDA contexts on the main device.
+
+    Unlike a real Pipe, send() executes the requested function synchronously. Callers therefore keep this
+    output-device pseudo-worker last in TP fan-out order, so spawned workers are already running before the main
+    process enters collectives or barriers on its own rank.
     """
 
     def __init__(
@@ -292,6 +416,10 @@ class PseudoParentConn:
         else:
             fn, args = msg
             self.result = fn(self.local_context, *args)
+
+
+    def poll(self, timeout):
+        return True
 
 
     def recv(self):

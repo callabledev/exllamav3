@@ -224,10 +224,12 @@ class Linear(Module):
             if bias is not None:
                 bias = bias[self.frange[0] : self.frange[1]].contiguous()
                 bias = self.pad_out(bias)
+            if self.ftranspose_after_load:
+                weight = weight.T.contiguous()
             self.inner = LinearFP16(
                 self.in_features,
                 self.out_features,
-                weight.T.contiguous(),
+                weight,
                 bias,
                 self.full_in_features,
                 self.full_out_features,
@@ -528,6 +530,20 @@ class Linear(Module):
         module.quant_type = module.inner.quant_type
         module.out_features = module.inner.out_features
         return module
+
+    @staticmethod
+    def tp_import_split_3(local_context, exported, plan, split_0, split_1, split_2):
+        device = local_context["device"]
+        module = Linear(
+            config = None,
+            **exported["kwargs"],
+        )
+        module.device = device
+        module.inner = exported["inner"]["cls"].tp_import_split_3(local_context, exported["inner"], plan, split_0, split_1, split_2)
+        module.quant_type = module.inner.quant_type
+        module.out_features = module.inner.out_features
+        return module
+
 
     @staticmethod
     def tp_import(local_context, exported, plan):

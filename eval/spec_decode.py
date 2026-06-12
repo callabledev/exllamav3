@@ -15,6 +15,7 @@ col_red = "\u001b[31;1m"
 col_green = "\u001b[32;1m"  # Green
 
 prompt_files = [
+    ("Trivial repetition", "trivial.json", False),
     ("Agentic, code", "agentic_code_01.json", True),
     ("Agentic, code", "agentic_code_05.json", True),
     ("Agentic, code", "agentic_code_10.json", True),
@@ -114,7 +115,10 @@ def measure(generator, tokenizer, sampler, max_new_tokens):
 
 @torch.inference_mode()
 def main(args):
-    model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(args)
+    model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(
+        args,
+        min_draft_len = args.ngram_draft_length
+    )
 
     # Baseline
     result_baseline = None
@@ -164,6 +168,8 @@ def main(args):
     draft_mode = "Draft model"
     if args.draft_model_dir and draft_model.caps.get("dflash_draft"):
         draft_mode = "DFlash"
+    if args.draft_model_dir and draft_model.caps.get("mtp_draft"):
+        draft_mode = "MTP"
     r = {
         "Baseline": result_baseline,
         "N-gram (greedy)": result_ngram,
@@ -208,7 +214,13 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    model_init.add_args(parser, default_cache_size = 49152, cache = True, add_draft_model_args = True, )
+    model_init.add_args(
+        parser,
+        default_cache_size = 49152,
+        cache = True,
+        add_draft_model_args = True,
+        default_autosplit_max_batch_size = 1,
+    )
     parser.add_argument("-nbl", "--no_baseline", action = "store_true", help = "Skip baseline measurement")
     parser.add_argument("-ngram_min", "--ngram_match_min", type = int, help = "N-gram minimum match length, default = 0 (disabled)", default = 0)
     parser.add_argument("-ngram_len", "--ngram_draft_length", type = int, help = "N-gram draft length, default = 4", default = 4)

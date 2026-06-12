@@ -1,4 +1,6 @@
 from __future__ import annotations
+import importlib.machinery
+import importlib.util
 import torch
 from torch.utils.cpp_extension import load
 import os
@@ -15,13 +17,18 @@ windows = (os.name == "nt")
 
 # Determine if extension is already installed or needs to be built
 
-build_jit = False
-try:
-    import exllamav3_ext
-except ModuleNotFoundError:
-    build_jit = True
+def is_precompiled_extension_available():
+    spec = importlib.util.find_spec(extension_name)
+    if not spec or not spec.origin or not spec.loader:
+        return False
+    return any(
+        spec.origin.endswith(suffix)
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    )
 
-if build_jit:
+if is_precompiled_extension_available():
+    import exllamav3_ext
+else:
 
     # Kludge to get compilation working on Windows
 
@@ -101,6 +108,9 @@ if build_jit:
         if ext_debug:
             extra_cflags += ["-ftime-report", "-DTORCH_USE_CUDA_DSA"]
             extra_cuda_cflags += []
+
+    if not windows and (cuda_host_cxx := os.environ.get("CUDAHOSTCXX")):
+        extra_cuda_cflags += ["-ccbin", cuda_host_cxx]
 
     if torch.version.hip:
         extra_cuda_cflags += ["-DHIPBLAS_USE_HIP_HALF"]

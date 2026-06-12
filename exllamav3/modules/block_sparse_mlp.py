@@ -219,7 +219,8 @@ class BlockSparseMLP(Module):
         transpose_fused_weights: bool = True,
         ftranspose_after_load: bool = True,
         frange_dim: int = 0,
-        alt_residual_channel: bool = False
+        alt_residual_channel: bool = False,
+        qbits_key: str = "bits"
     ):
         super().__init__(config, key, None)
 
@@ -321,13 +322,14 @@ class BlockSparseMLP(Module):
                     frange = (0, intermediate_size) if key_gate_up_split else None,
                     in_features = hidden_size,
                     out_features = intermediate_size,
-                    qmap = qmap + ".input",
+                    qmap = qmap + ".input" if qmap else None,
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
                     ftranspose_after_load = ftranspose_after_load,
                     frange_dim = frange_dim,
                     qgroup = key + ".block_gud",
+                    qbits_key = qbits_key,
                 )
                 up = Linear(
                     config = config,
@@ -337,13 +339,14 @@ class BlockSparseMLP(Module):
                     frange = (intermediate_size, intermediate_size * 2) if key_gate_up_split else None,
                     in_features = hidden_size,
                     out_features = intermediate_size,
-                    qmap = qmap + ".input",
+                    qmap = qmap + ".input" if qmap else None,
                     out_dtype = self.interm_dtype,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
                     ftranspose_after_load = ftranspose_after_load,
                     frange_dim = frange_dim,
                     qgroup = key + ".block_gud",
+                    qbits_key = qbits_key,
                 )
                 down = Linear(
                     config = config,
@@ -352,13 +355,14 @@ class BlockSparseMLP(Module):
                     fidx = idx,
                     in_features = intermediate_size,
                     out_features = hidden_size,
-                    qmap = qmap + f".{idx}.down",
+                    qmap = qmap + f".{idx}.down" if qmap else None,
                     out_dtype = torch.float,
                     allow_input_padding = True,
                     transposed_load = transposed_load,
                     transpose_fused_weights = transpose_fused_weights,
                     ftranspose_after_load = ftranspose_after_load,
                     qgroup = key + ".block_gud",
+                    qbits_key = qbits_key,
                 )
 
                 self.ups.append(up)
@@ -614,12 +618,15 @@ class BlockSparseMLP(Module):
         super().load(device, **kwargs)
 
         if self.e_score_correction_bias_key:
-            self.e_score_correction_bias = self.config.stc.get_tensor(
-                f"{self.key}.{self.e_score_correction_bias_key}",
-                self.device,
-                optional = True,
-                float2half = True,
-            )
+            for k in [self.e_score_correction_bias_key, "gate.e_score_correction_bias"]:
+                self.e_score_correction_bias = self.config.stc.get_tensor(
+                    f"{self.key}.{k}",
+                    self.device,
+                    optional = True,
+                    float2half = True,
+                )
+                if self.e_score_correction_bias is not None:
+                    break
         if self.per_expert_scale_key:
             self.per_expert_scale = self.config.stc.get_tensor(
                 f"{self.key}.{self.per_expert_scale_key}",
@@ -1024,7 +1031,7 @@ class BlockSparseMLP(Module):
     def get_tensors(self):
         t = super().get_tensors()
         if self.e_score_correction_bias is not None:
-            t[f"{self.key}.gate.e_score_correction_bias"] = self.e_score_correction_bias.contiguous()
+            t[f"{self.key}.{self.e_score_correction_bias_key}"] = self.e_score_correction_bias.contiguous()
         if self.per_expert_scale is not None:
             t[f"{self.key}.{self.per_expert_scale_key}"] = self.per_expert_scale.contiguous()
         return t
@@ -1033,6 +1040,8 @@ class BlockSparseMLP(Module):
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         storage += self.routing_gate.storage_size()
+        if self.shared_gate:
+            storage += self.shared_gate.storage_size()
         for g in self.gates: storage += g.storage_size()
         for u in self.ups: storage += u.storage_size()
         for d in self.downs: storage += d.storage_size()
@@ -1089,6 +1098,7 @@ class BlockSparseMLP(Module):
                 "act_limit": self.act_limit,
             },
             "routing_gate": _export(self.routing_gate),
+            "shared_gate": _export(self.shared_gate),
             "e_score_correction_bias": producer.send(self.e_score_correction_bias),
             "gates": [_export(self.gates[i]) for i in range(self.num_experts)],
             "ups": [_export(self.ups[i]) for i in range(self.num_experts)],
@@ -1159,6 +1169,7 @@ class BlockSparseMLP(Module):
             ups = ups,
             downs = downs,
             shared_experts = _import_no_reduce("shared_experts"),
+            shared_gate = _import("shared_gate"),
             routing_gate = _import("routing_gate") if device == output_device else None,
             routing_first = routing_first,
             routing_last = routing_last,

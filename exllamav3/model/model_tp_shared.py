@@ -26,6 +26,13 @@ class SMProducer:
         shm_name: str | None = None,
         buffer_size: int = DEFAULT_BUFFER_SIZE,
     ):
+        """
+        Create the producer side of a shared-memory tensor transfer arena.
+
+        The parent process writes serialized CPU tensor bytes into this arena and sends only small metadata records
+        over multiprocessing pipes. The arena is pre-touched to avoid page faults during load/dispatch, and large
+        CPU tensors can be cached by cache_id so repeated exports do not recopy the same payload.
+        """
         self.shm_name = shm_name or uuid.uuid4().hex
         self.buffer_size = buffer_size
 
@@ -43,12 +50,21 @@ class SMProducer:
         self.cache_size = 0
 
     def export(self):
+        """
+        Return the metadata needed for another process to open this shared-memory arena.
+        """
         return {
             "shm_name": self.shm_name,
             "buffer_size": self.buffer_size,
         }
 
     def send(self, tensor: torch.Tensor | None, cache_id: int = None) -> dict:
+        """
+        Copy a tensor into shared memory and return a compact import descriptor.
+
+        Small metadata describes whether the payload is absent, already cached by the consumer, stored in this
+        arena at a byte offset, or exported through torch's slower share_memory_ fallback when the arena is full.
+        """
 
         # None tensor
         if tensor is None:
@@ -106,6 +122,9 @@ class SMProducer:
         }
 
     def clear(self):
+        """
+        Reset the arena write pointer so subsequent sends can reuse the buffer.
+        """
         self.next_offset = 0
 
     def close(self):
@@ -121,6 +140,13 @@ class SMConsumer:
         device: int | None = None,
         pin_memory: bool = False,
     ):
+        """
+        Open the consumer side of a shared-memory tensor transfer arena.
+
+        Remote workers receive producer metadata and open the named shared-memory object; the local pseudo-worker
+        can consume the producer directly. When pin_memory is enabled, the arena is registered with CUDA so recv()
+        can perform non-blocking copies to the worker device.
+        """
         self.pin_memory = pin_memory
         self.device = device
         torch.cuda.set_device(self.device)
@@ -177,6 +203,13 @@ class SMConsumer:
         first: int | None = None,
         last: int | None = None,
     ) -> torch.Tensor | None:
+        """
+        Reconstruct a tensor from a producer descriptor.
+
+        The descriptor may refer to None, a cached CPU tensor, a torch shared-memory fallback tensor, or a byte
+        range in the shared arena. Optional slicing is applied before the final clone or CUDA copy, which lets TP
+        workers import only their shard of a larger exported tensor.
+        """
 
         if cuda:
             torch.cuda.set_device(self.device)
@@ -236,3 +269,43 @@ class SMConsumer:
             cuda_host_unregister(self.arena.data_ptr())
         if self.producer is not None:
             self.shm.close()
+
+
+class TPTensorWrapper:
+
+    @staticmethod
+    def tp_export(t: torch.Tensor, plan, producer):
+        return {
+            "cls": TPTensorWrapper,
+            "weight": producer.send(t),
+            "device": t.device,
+        }
+
+    @staticmethod
+    def tp_import_split(local_context, exported, plan, split, dbg = False):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        id_w = exported["weight"]
+
+        assert split is not None
+        _, first, last = split
+        w = consumer.recv(id_w, cuda = True, slice_dim = 0, first = first, last = last)
+        return w
+
+
+    @staticmethod
+    def tp_import_split_3(local_context, exported, plan, split_0, split_1, split_2, dbg = False):
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        id_w = exported["weight"]
+
+        w_ = []
+
+        for split in [split_0, split_1, split_2]:
+            assert split is not None
+            _, first, last = split
+            w = consumer.recv(id_w, cuda = True, slice_dim = 0, first = first, last = last)
+            w_.append(w)
+
+        w = torch.cat(w_, dim = 0).contiguous()
+        return w

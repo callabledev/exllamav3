@@ -81,6 +81,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_broadcast_ll", &pg_broadcast_ll, "pg_broadcast_ll");
     m.def("pg_barrier", &pg_barrier, "pg_barrier");
     m.def("pg_gather", &pg_gather, "pg_gather");
+    m.def("pg_gather_small", &pg_gather_small, "pg_gather_small");
     m.def("pg_all_reduce", &pg_all_reduce, "pg_all_reduce");
     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
     m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
@@ -93,6 +94,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("unpack_trellis", &unpack_trellis, "unpack_trellis");
     m.def("pack_signs", &pack_signs, "pack_signs");
     m.def("reconstruct", &reconstruct, "reconstruct");
+    m.def("reconstruct_slice", &reconstruct_slice, "reconstruct_slice");
     m.def("had_r_128", &had_r_128, "had_r_128");
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
