@@ -91,11 +91,16 @@ def add_args(
     if cache:
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
+        parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
+
 
     if add_draft_model_args:
         parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
         parser.add_argument("-ndt", "--num_draft_tokens", type = int, help = "Number of draft tokens (default: draft model default, else 4)", default = None)
         parser.add_argument("-mtp", "--mtp", action = "store_true", help = "Use MTP drafting")
+        parser.add_argument("-ngram", "--ngram_match_min", type = int, help = "N-gram draft minimum match length, default = 0 (disabled)", default = 0)
+        parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
+        parser.add_argument("-dskip", "--draft_skip_ema", type = float, help = "Skip drafting while EMA below this threshold (0 = disabled, default: 0.3)", default = 0.3)
 
 
 def get_arg_sampler(args):
@@ -169,10 +174,13 @@ def init(
 
     return_draft = "draft_model_dir" in args
     draft_model_dir = args.draft_model_dir if return_draft else None
-    assert not (args.mtp and draft_model_dir), "Cannot specify both --mtp and --draft_model_dir"
-    if args.mtp:
-        args.draft_model_dir = draft_model_dir = args.model_dir
-    use_mtp = draft_model_dir and Path(args.model_dir).resolve() == Path(draft_model_dir).resolve()
+    if "mtp" in args:
+        assert not (args.mtp and draft_model_dir), "Cannot specify both --mtp and --draft_model_dir"
+        if args.mtp:
+            args.draft_model_dir = draft_model_dir = args.model_dir
+        use_mtp = draft_model_dir and Path(args.model_dir).resolve() == Path(draft_model_dir).resolve()
+    else:
+        use_mtp = False
 
     # Config
     config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
@@ -216,8 +224,9 @@ def init(
     # Cache
     max_history = max(
         min_draft_len or 0,
-        draft_model.caps.get("default_draft_size") if draft_model else 0,
-        vars(args).get("num_draft_tokens") or 0
+        draft_model.caps.get("default_draft_size", 4) if draft_model else 0,
+        vars(args).get("num_draft_tokens") or 0,
+        4 if (vars(args).get("ngram_match_min") and not vars(args).get("num_draft_tokens")) else 0,
     )
     if "cache_size" in vars(args):
         if args.cache_quant is not None:
@@ -234,6 +243,7 @@ def init(
                 layer_type = CacheLayer_quant,
                 k_bits = k_bits,
                 v_bits = v_bits,
+                compand_a = args.cache_compand_a,
                 max_history = max_history,
                 max_batch_size = args.autosplit_max_batch_size,
             )

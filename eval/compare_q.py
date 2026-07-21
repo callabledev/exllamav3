@@ -426,7 +426,7 @@ def format_dataset_subtitle(spec: dict) -> str:
     length = spec.get("display_eval_len", spec["eval_len"] - wut)
     st = f"{dataset_name}, {rows} × {length} tokens"
     if wut:
-        spec += f", {wut} token warmup"
+        st += f", {wut} token warmup"
     if spec.get("chat_template"):
         st += ", formatted"
     return st
@@ -494,7 +494,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(allow_abbrev = False)
     parser.add_argument("-d", "--dataspec", type = str, help = "Data specification (JSON file)")
     parser.add_argument("-m", "--modelspec", type = str, nargs="+", help = "Model specification (JSONL file), accepts wildcard")
     parser.add_argument("-cc", "--clear_cache", action = "store_true", help = "Clear cache")
