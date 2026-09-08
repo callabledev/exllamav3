@@ -1,4 +1,5 @@
 from __future__ import annotations
+import logging
 import torch
 from ..model.model import Model
 from ..cache.cache import Cache
@@ -6,7 +7,12 @@ from ..cache.recurrent import RecurrentCache
 from ..tokenizer.tokenizer import Tokenizer
 from ..constants import PAGE_SIZE
 from ..util import cuda_sync_active
-from .pagetable import PageTable
+
+logger = logging.getLogger(__name__)
+from ..util.memory import malloc_trim
+from .pagetable import PageTable, is_content_hash
+from .cpu_cache import CPUPageCache
+from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -32,15 +38,13 @@ class Generator:
         num_draft_tokens: int | None = None,
         show_visualizer: bool = False,
         enable_defrag: bool = True,
+        cpu_cache_size: int = 0,
         recurrent_cache_size: int = 4 * 1024**3,
         recurrent_checkpoint_interval: int = None,
         recurrent_checkpoint_interval_pp: int = 32768,
         ngram_match_min: int = 0,
         dynamic_draft_tokens: bool = False,
-        dynamic_draft_alpha_up: float = 1.30,
-        dynamic_draft_alpha_down: float = 0.65,
-        dynamic_draft_skip_ema: float = 0.3,
-        dynamic_draft_probe_interval: int = 16,
+        draft_confidence: float = 0.4,
         record_draft_stats: bool = False,
         **kwargs
     ):
@@ -84,37 +88,37 @@ class Generator:
             Minimum number of tokens to match for n-gram draft (0 = disabled).
 
         :param dynamic_draft_tokens:
-            Adapt the per-round draft length to the workload: each job tracks an exponential moving average of
-            accepted draft tokens per verification window, and the next window is sized just above it (bounded by
-            [1, num_draft_tokens], so num_draft_tokens acts as the ceiling). A fully accepted window counts as one
-            more than observed, since acceptance is censored by the window size; this lets the window grow again
-            when the output becomes predictable. Applies to draft-model, MTP and n-gram drafting; DFlash drafts
-            in fixed blocks and is unaffected.
+            Adapt the per-round draft length to the workload. The draft is cut using drafter confidence
+            (argmax logit), calibrated online against observed acceptance rates (see draft_confidence). A
+            DFlash drafter still runs at its fixed diffusion block size and only the verified window shrinks;
+            AR and MTP drafters stop the drafting loop itself early, saving one drafter forward per pruned
+            position. The acceptance behavior of the surviving positions is unchanged. Has no effect on n-gram
+            drafting, whose draft length already adapts through the match length.
 
-        :param dynamic_draft_alpha_up:
-            EMA weight of the most recent verification window when it raises the average. Asymmetric with
-            alpha_down so the window grows quickly into a predictable stretch but survives isolated rejections.
-
-        :param dynamic_draft_alpha_down:
-            EMA weight of the most recent verification window when it lowers the average.
-
-        :param dynamic_draft_skip_ema:
-            If > 0, skip drafting entirely for a job while its EMA is below this threshold, eliminating draft
-            overhead through unpredictable stretches. Since no drafts means no acceptance signal, a small probe
-            window is drafted every dynamic_draft_probe_interval rounds to allow recovery. 0 disables (window
-            floor stays at 1).
-
-        :param dynamic_draft_probe_interval:
-            Maximum number of rounds (= tokens, when not drafting) between probe windows while skipping.
+        :param draft_confidence:
+            Used with dynamic_draft_tokens and a draft model: target acceptance probability for drafted
+            positions, evaluated against an online mapping from drafter confidence (argmax logit) to observed
+            acceptance rates. Scale-free and portable across model pairs. For DFlash (block produced at fixed
+            cost) the block is cut at the first position whose estimated conditional acceptance drops below
+            the target. For AR and MTP drafters (one forward per position, and a position only pays off if
+            everything before it is accepted too) drafting stops when the running product of conditional
+            estimates - the probability that the next position actually contributes a token - falls below the
+            target. Lower values keep longer drafts; higher values truncate more aggressively. Ignored for
+            n-gram drafting.
 
         :param record_draft_stats:
-            Append (position, window, accepted, ema) per verification round to job.draft_stats, for analysis.
+            Append (position, window, accepted) per verification round to job.draft_stats, for analysis.
 
         :param show_visualizer:
             Open window to render visualization of cache (for debug/demonstration purposes)
 
         :param enable_defrag:
             Defragment cache periodically
+
+        :param cpu_cache_size:
+            Size in bytes of a second-tier page cache in pinned system memory, 0 (default) to disable. Complete
+            K/V pages evicted from the GPU cache are stored there and restored on prompt-cache hits instead of
+            being recomputed by prefill. Not currently supported in tensor-parallel mode
 
         :param recurrent_cache_size:
             Size of recurrent cache, in bytes. Recurrent cache resides in system RAM. Default is 4 GB.
@@ -139,7 +143,11 @@ class Generator:
 
         # Paging
         self.pagetable = PageTable(self, cache)
+        # A cache has exactly one owning generator. Record the takeover and refuse to iterate a superseded generator
+        cache.owner_serial = getattr(cache, "owner_serial", 0) + 1
+        self.cache_owner_serial = cache.owner_serial
         self.max_total_tokens = PAGE_SIZE * self.pagetable.max_pages
+        self._cache_stats_memo = (None, None)
 
         # Draft model
         self.draft_model = draft_model
@@ -163,12 +171,7 @@ class Generator:
             self.num_draft_tokens = 0
 
         self.ngram_match_min = ngram_match_min
-        is_dflash = draft_model is not None and draft_model.caps.get("dflash_draft", False)
-        self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0 and not is_dflash
-        self.dynamic_draft_alpha_up = dynamic_draft_alpha_up
-        self.dynamic_draft_alpha_down = dynamic_draft_alpha_down
-        self.dynamic_draft_skip_ema = dynamic_draft_skip_ema
-        self.dynamic_draft_probe_interval = dynamic_draft_probe_interval
+        self.dynamic_draft = dynamic_draft_tokens and self.num_draft_tokens > 0
         self.record_draft_stats = record_draft_stats
         max_q_size = max(self.num_draft_tokens + 1, max_q_size)
 
@@ -202,6 +205,14 @@ class Generator:
                 pin_memory = False
             )
 
+        # CPU page cache tier
+        self.cpu_page_cache = None
+        if cpu_cache_size:
+            tier_caches = [cache] + ([draft_cache] if draft_cache is not None else [])
+            self.cpu_page_cache = CPUPageCache(tier_caches, cpu_cache_size)
+            self.cpu_page_cache.attach(self.pagetable)
+            self.pagetable.cpu_tier = self.cpu_page_cache
+
         # Visualizer
         if show_visualizer:
             self.visualizer = CacheVisualizer(self.pagetable.max_pages)
@@ -215,6 +226,9 @@ class Generator:
         self.recurrent_cache_size = recurrent_cache_size
         if self.model.caps.get("recurrent_states"):
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
+            self.recurrent_cache.pagetable = self.pagetable
+            # The new page table owns every page, so every state slot is ours too
+            cache.reset_states()
             # Limit batch size if cache has recurrent states
             self.max_batch_size = min(self.max_batch_size, cache.num_slots)
         else:
@@ -236,6 +250,16 @@ class Generator:
         self.dflash_draft = self.draft_model is not None and self.draft_model.caps.get("dflash_draft", False)
         self.mtp_draft = self.draft_model is not None and self.draft_model.caps.get("mtp_draft", False)
 
+        # Confidence-calibrated draft truncation (draft model + dynamic draft, any mode). For
+        # DFlash the fixed-size drafted block is truncated before verification; for AR draft
+        # models and MTP the drafting loop itself stops early, saving drafter forwards. Modes
+        # whose TP lm_head path returns only the argmax simply never export confidence values,
+        # leaving the calibrator inert
+        self.draft_calibrator = None
+        self._draft_conf_round = None
+        if self.dynamic_draft and self.draft_model is not None:
+            self.draft_calibrator = DraftConfidenceCalibrator(draft_confidence)
+
 
     def num_remaining_jobs(self):
         return len(self.pending_jobs) + len(self.active_jobs)
@@ -245,6 +269,104 @@ class Generator:
 
     def num_pending_jobs(self):
         return len(self.pending_jobs)
+
+    def get_cache_stats(self) -> dict:
+        """
+        Snapshot of cache occupancy and prompt-cache efficiency, intended for status displays.
+
+        Returns a dict with:
+            page_size: tokens per page
+            max_tokens: total cache capacity, in tokens
+            used_tokens: tokens in pages referenced by active jobs
+            cached_tokens: tokens in complete pages that a later or concurrent job could actually reuse: every
+                page on an unbroken chain down to a root, whether or not an active job currently references it.
+                Complete pages whose ancestors were evicted (orphans) don't count, since a prefix match walks
+                the chain from the root
+            free_tokens: tokens in unreferenced pages holding no reusable content
+            tier_cached_tokens: reusable tokens held only in the system-memory tier (sysmem K/V cache), by the
+                same chain rule; 0 without a tier
+            tier_max_tokens: capacity of the system-memory tier, 0 without one
+            alloc_pages: cumulative pages claimed by started jobs
+            alloc_cached_pages: cumulative pages of those that were reused from the prompt cache
+            alloc_tier_pages: of those, pages restored from the system-memory tier
+            hit_rate: alloc_cached_pages / alloc_pages, or None before any job has started
+            tier_hit_rate: alloc_tier_pages / alloc_pages, the part of hit_rate served from the system-memory
+                tier, or None before any job has started
+            active_jobs, pending_jobs: current job counts
+
+        The chain walk is memoized on a signature of the page tables, so repeated calls between changes are
+        cheap.
+        """
+        pt = self.pagetable
+        tier = pt.cpu_tier
+
+        # The chain walk is linear in the number of pages, which can be large with a big system-memory
+        # tier, so it only reruns when something that can change the outcome has moved
+        signature = (
+            len(pt.referenced_pages),
+            len(pt.unreferenced_pages),
+            sum(1 for h in pt.referenced_pages if is_content_hash(h)),
+            pt.metrics["alloc_pages"],
+            pt.metrics["evictions"],
+            pt.last_defrag_serial,
+            len(tier) if tier is not None else 0,
+            (tier.metrics["pushes"], tier.metrics["evictions"]) if tier is not None else None,
+        )
+        memo_signature, memo = self._cache_stats_memo
+        if signature == memo_signature:
+            return {**memo, "active_jobs": len(self.active_jobs), "pending_jobs": len(self.pending_jobs)}
+
+        # prev-hash links of every complete page, per tier
+        gpu_links = {}
+        for pages in (pt.referenced_pages, pt.unreferenced_pages):
+            for h, page in pages.items():
+                if is_content_hash(h):
+                    gpu_links[h] = page.prev_hash
+        tier_links = {h: e["prev_hash"] for h, e in tier.entries.items()} if tier is not None else {}
+
+        # A page is reusable when its whole chain is present in either tier
+        resumable = {}
+        def is_resumable(h):
+            chain = []
+            while h is not None and h not in resumable:
+                chain.append(h)
+                if h in gpu_links:
+                    h = gpu_links[h]
+                elif h in tier_links:
+                    h = tier_links[h]
+                else:
+                    resumable[h] = False
+                    break
+            result = True if h is None else resumable[h]
+            for c in chain:
+                resumable[c] = result
+            return result
+
+        cached = sum(1 for h in gpu_links if is_resumable(h))
+        tier_cached = sum(1 for h in tier_links if h not in gpu_links and is_resumable(h))
+        used = len(pt.referenced_pages)
+        free = sum(1 for h in pt.unreferenced_pages if not is_content_hash(h))
+        alloc = pt.metrics["alloc_pages"]
+        alloc_cached = pt.metrics["alloc_cached_pages"]
+        alloc_tier = pt.metrics["alloc_tier_pages"]
+        stats = {
+            "page_size": PAGE_SIZE,
+            "max_tokens": pt.max_pages * PAGE_SIZE,
+            "used_tokens": used * PAGE_SIZE,
+            "cached_tokens": cached * PAGE_SIZE,
+            "free_tokens": free * PAGE_SIZE,
+            "tier_cached_tokens": tier_cached * PAGE_SIZE,
+            "tier_max_tokens": tier.max_slots * PAGE_SIZE if tier is not None else 0,
+            "alloc_pages": alloc,
+            "alloc_cached_pages": alloc_cached,
+            "alloc_tier_pages": alloc_tier,
+            "hit_rate": alloc_cached / alloc if alloc else None,
+            "tier_hit_rate": alloc_tier / alloc if alloc else None,
+            "active_jobs": len(self.active_jobs),
+            "pending_jobs": len(self.pending_jobs),
+        }
+        self._cache_stats_memo = (signature, stats)
+        return stats
 
 
     def clear_queue(self):
@@ -258,7 +380,7 @@ class Generator:
         self.active_jobs.clear()
         self.pending_jobs.clear()
         if num_jobs and not self.num_remaining_jobs():
-            self.pagetable.defrag()
+            self.on_queue_drained()
 
 
     def enqueue(
@@ -312,7 +434,7 @@ class Generator:
             job.deallocate_pages()
             self.active_jobs.remove(job)
         if num_jobs and not self.num_remaining_jobs():
-            self.pagetable.defrag()
+            self.on_queue_drained()
 
 
     @torch.inference_mode
@@ -381,12 +503,30 @@ class Generator:
             }
         """
 
+        assert self.cache.initialized, \
+            "Cache tensors were never allocated. Construct the Cache BEFORE calling model.load()"
+        owner_serial = getattr(self.cache, "owner_serial", None)
+        if owner_serial is not None and owner_serial != getattr(self, "cache_owner_serial", owner_serial):
+            # Superseded: drop every job without touching the cache (the new owner may already have
+            # reused these pages and state slots) and refuse to run
+            self.pending_jobs.clear()
+            self.active_jobs.clear()
+            raise RuntimeError(
+                "This Generator no longer owns its Cache: a newer Generator was created over the same "
+                "Cache. Close or discard the old Generator before creating a new one."
+            )
+        assert self.draft_cache is None or self.draft_cache.initialized, \
+            "Draft cache tensors were never allocated. Construct the draft Cache BEFORE calling draft_model.load()"
+
         results = []
         self.iterate_start_jobs(results)
 
         # Perform one round of prefill
-        for job in self.active_jobs:
-            job.prefill(results)
+        for job in list(self.active_jobs):
+            try:
+                job.prefill(results)
+            except Exception as e:
+                self.reap_failed_job(job, e, results)
 
         # Recurrent checkpoints
         if self.recurrent_cache is not None:
@@ -421,6 +561,25 @@ class Generator:
         return results
 
 
+    @torch.inference_mode()
+    def on_queue_drained(self):
+        """
+        Idle-transition housekeeping: drop recurrent checkpoints stranded by KV eviction, then defragment the
+        page table (both need/prefer a moment with no active block tables), and return whatever host memory
+        glibc is retaining from stash/offload churn (issue #277) — sub-threshold residue would otherwise sit
+        in the arenas for the whole idle period.
+        """
+        if self.recurrent_cache is not None:
+            self.recurrent_cache.prune_stranded()
+        self.pagetable.defrag()
+        # Dynamic expert placement: apply any pending swap sweep now, between generations —
+        # a placement change perturbs the logits slightly (same expert, different device
+        # numerics) and must never land mid-stream
+        from ..modules.block_sparse_mlp_cpu import run_pending_swap_sweeps
+        run_pending_swap_sweeps(self.model.config.infer_params)
+        malloc_trim()
+
+
     def recurrent_checkpoint(self):
         for job in self.active_jobs:
             job.maybe_stash_recurrent(self.recurrent_cache)
@@ -439,25 +598,9 @@ class Generator:
         self.visualizer.update(chains, usage)
 
 
-    def draft_window(self):
-        """
-        Number of tokens to draft this round. The verification batch shares one width, so take the largest target
-        among participating jobs; jobs wanting shorter windows just reject earlier. 0 means skip drafting.
-        """
-        if not self.dynamic_draft:
-            return self.num_draft_tokens
-        w = 0
-        for job in self.active_jobs:
-            if not job.is_prefill_done(): continue
-            w = max(w, job.draft_target(
-                self.num_draft_tokens,
-                self.dynamic_draft_skip_ema,
-                self.dynamic_draft_probe_interval,
-            ))
-        return w
-
-
     def iterate_draftmodel_gen(self, results: list):
+
+        self._draft_conf_round = None
 
         # Get shape of active batch
         batch_size = 0
@@ -500,10 +643,11 @@ class Generator:
         batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
 
-        # Greedy sample batched draft tokens
-        window = self.draft_window()
-        if window == 0:
-            return None
+        # Greedy sample batched draft tokens. With a confidence calibrator, drafting stops early
+        window = self.num_draft_tokens
+        cal = self.draft_calibrator
+        conf_cols = []
+        reach = None
         for idx in range(window):
             batch_logits = self.draft_model.forward(
                 input_ids = batch_ids,
@@ -514,10 +658,21 @@ class Generator:
                     "cache_seqlens": cache_seqlens,
                 }
             )
-            new_ids = torch.argmax(batch_logits, dim = -1)
+            if cal is not None:
+                conf, new_ids = torch.max(batch_logits, dim = -1)
+            else:
+                new_ids = torch.argmax(batch_logits, dim = -1)
             self.draft_ids_pinned[:batch_size, idx:idx+1].copy_(new_ids)
             batch_ids.copy_(new_ids)
             cache_seqlens += 1
+            if cal is not None:
+                c = conf.float().cpu()
+                conf_cols.append(c)
+                est = [cal.estimate(v) for v in c.view(-1).tolist()]
+                reach = est if reach is None else [r * e for r, e in zip(reach, est)]
+                if idx + 1 < window and max(reach) < cal.confidence:
+                    window = idx + 1
+                    break
 
         self.draft_model.prefill(
             input_ids = batch_ids,
@@ -529,10 +684,19 @@ class Generator:
             }
         )
 
+        if conf_cols:
+            self._draft_conf_round = {
+                "ids": self.draft_ids_pinned[:batch_size, :window],
+                "conf": torch.cat(conf_cols, dim = 1),
+                "window": window,
+            }
+
         return self.draft_ids_pinned[:, :window]
 
 
     def iterate_draftmodel_mtp_gen(self, results: list):
+
+        self._draft_conf_round = None
 
         # Get shape of active batch
         batch_size = 0
@@ -577,10 +741,13 @@ class Generator:
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
         temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
 
-        # Greedy sample batched draft tokens
-        window = self.draft_window()
-        if window == 0:
-            return None
+        # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
+        # every row's running product of estimated conditional acceptance probabilities falls
+        # below the confidence target, keeping the first low-confidence token as the label probe
+        window = self.num_draft_tokens
+        cal = self.draft_calibrator
+        conf_cols = []
+        reach = None
         for idx in range(window):
             params = {
                 "target_hidden": temp_hidden,
@@ -589,6 +756,8 @@ class Generator:
                 "cache": self.draft_cache,
                 "cache_seqlens": cache_seqlens,
             }
+            if cal is not None:
+                params["export_draft_conf"] = True
             batch_state = self.draft_model.forward(batch_ids, params)
             lm_head = self.model.modules[self.model.logit_layer_idx]
             batch_state = lm_head.prepare_for_device(batch_state, params)
@@ -597,13 +766,30 @@ class Generator:
             batch_ids.copy_(new_ids)
             cache_seqlens += 1
             temp_hidden = batch_state
+            draft_conf = params.get("draft_conf")
+            if cal is not None and draft_conf is not None:
+                c = draft_conf.float().cpu()
+                conf_cols.append(c)
+                est = [cal.estimate(v) for v in c.view(-1).tolist()]
+                reach = est if reach is None else [r * e for r, e in zip(reach, est)]
+                if idx + 1 < window and max(reach) < cal.confidence:
+                    window = idx + 1
+                    break
 
+        if conf_cols and len(conf_cols) == window:
+            self._draft_conf_round = {
+                "ids": self.draft_ids_pinned[:batch_size, :window],
+                "conf": torch.cat(conf_cols, dim = 1),
+                "window": window,
+            }
 
         return self.draft_ids_pinned[:, :window]
 
 
     # TODO: Refactor, share code with other draft fns
     def iterate_draftmodel_dflash_gen(self, results: list):
+
+        self._draft_conf_round = None
 
         # Get shape of active batch
         batch_size = 0
@@ -618,6 +804,9 @@ class Generator:
             batch_size += 1
         if batch_size == 0:
             return None
+
+        # The diffusion drafter always runs at its fixed block size, dynamic window truncates the drafted block
+        window = self.num_draft_tokens
 
         # Create block index table for batch
         max_pages_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
@@ -651,16 +840,46 @@ class Generator:
             "cache": self.draft_cache,
             "cache_seqlens": cache_seqlens,
         }
+        if self.draft_calibrator is not None:
+            params["export_draft_conf"] = True
         out_state = self.draft_model.forward(
             input_ids = batch_ids,
             params = params,
         )
         new_ids = self.draft_model.sample_from_state(out_state, params)
 
+        # Draft models with a confidence head cap the usable draft length per round;
+        # 0 means no draft position cleared the threshold, so skip drafting entirely
+        conf_len = params.get("draft_confidence_len")
+        if conf_len is not None:
+            if conf_len == 0:
+                return None
+            window = min(window, conf_len)
+
         # Crop out the first token after sampling to keep batch contiguous for lm_head
         new_ids = new_ids[:, 1:]
-        self.draft_ids_pinned[:batch_size, :self.num_draft_tokens].copy_(new_ids[:batch_size, :self.num_draft_tokens])
-        return self.draft_ids_pinned
+
+        # Confidence-calibrated truncation: cut the batch window at the first position whose
+        # drafter confidence falls below the calibrated threshold, taking the longest cut across
+        # rows (jobs wanting less just reject earlier). The full block and
+        # its scores are kept so iterate_gen can label the verified positions afterwards
+        draft_conf = params.get("draft_conf")
+        if self.draft_calibrator is not None and draft_conf is not None:
+            conf = draft_conf[:batch_size, 1:].float().cpu()
+            ids_full = new_ids[:batch_size, :].cpu()
+            thr = self.draft_calibrator.threshold()
+            below = conf[:, :window] < thr
+            any_below = below.any(dim = 1)
+            first_below = below.int().argmax(dim = 1)
+            cuts = torch.where(any_below, first_below, torch.full_like(first_below, window))
+            w_used = int(cuts.max().item())
+            self._draft_conf_round = {"ids": ids_full, "conf": conf, "window": w_used}
+            if w_used == 0:
+                return None
+            window = w_used
+
+        self.draft_ids_pinned[:batch_size, :window].copy_(new_ids[:batch_size, :window])
+        return self.draft_ids_pinned[:, :window]
 
 
     def iterate_ngram_gen(self, results: list):
@@ -676,9 +895,7 @@ class Generator:
             return None
 
         # Generate draft
-        window = self.draft_window()
-        if window == 0:
-            return None
+        window = self.num_draft_tokens
         draft_ids = []
         min_len = window
         for job in self.active_jobs:
@@ -954,8 +1171,19 @@ class Generator:
                         break
 
                     # EOS. Stop sampling this job immediately once a stop condition, filter condition or max
-                    # token limit produces an EOS event.
+                    # token limit produces an EOS event. Draft positions from the EOS position onward were fed
+                    # to verification but never resolved; count them as rejected so accepted + rejected equals
+                    # the number of drafted positions (no cache/state rollback needed, the pages are released).
+                    # The EOS stream event was already built inside receive_sample, so patch its counter too
                     if eos:
+                        num_unresolved = batch_logits.shape[1] - 1 - i if draft_tokens is not None else 0
+                        if num_unresolved:
+                            job.rejected_draft_tokens += num_unresolved
+                            for r_ in reversed(results):
+                                if r_.get("eos") and r_["job"] is job:
+                                    if "rejected_draft_tokens" in r_:
+                                        r_["rejected_draft_tokens"] = job.rejected_draft_tokens
+                                    break
                         completed_jobs.append(job)
                         break
 
@@ -1003,26 +1231,43 @@ class Generator:
                 if batch_states and draft_tokens is not None and rejected == 0:
                     batch_states[j].rewind(0)
 
-                # Track the moving average of accepted draft tokens. Skip abandoned windows (banned-string
-                # rewind); checkpoint-boundary truncations are rare enough to count as ordinary rejections.
+                # Record per-round draft stats. Skip abandoned windows (banned-string rewind);
+                # checkpoint-boundary truncations are rare enough to count as ordinary rejections.
                 if draft_tokens is not None and rejected != -1:
-                    if self.dynamic_draft:
-                        job.update_draft_ema(
-                            accepted_length - 1,
-                            draft_tokens.shape[-1],
-                            self.dynamic_draft_alpha_up,
-                            self.dynamic_draft_alpha_down,
-                        )
                     if self.record_draft_stats:
                         job.draft_stats.append((
                             job.new_tokens,
                             draft_tokens.shape[-1],
                             accepted_length - 1,
-                            job.draft_ema,
                         ))
 
                 accepted_lengths.append(accepted_length)
                 j += 1
+
+        # Update the draft-confidence calibration with this round's verification outcomes (any
+        # draft-model mode)
+        if self.draft_calibrator is not None and self._draft_conf_round is not None:
+            st = self._draft_conf_round
+            self._draft_conf_round = None
+            cal = self.draft_calibrator
+            row = 0
+            for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
+                if a_idx == b_idx: continue
+                accepted_length = accepted_lengths[row]
+                conf = st["conf"][row]
+                ids_full = st["ids"][row]
+                row += 1
+                if id(job) in rewound_jobs:
+                    continue
+                a = accepted_length - 1
+                for i in range(a):
+                    cal.add_label(conf[i].item(), True)
+                if a < conf.shape[-1]:
+                    seq = job.sequences[0]
+                    n = len(seq.sequence_ids)
+                    tail = seq.sequence_ids.torch_slice(n - 1, n).item()
+                    cal.add_label(conf[a].item(), ids_full[a].item() == tail)
+            cal.decay_step()
 
         # Accept new target_hidden if DFlash. DFlash draft models can update their cache from target-model hidden
         # states for the tokens accepted above, keeping draft and target cache layouts aligned.
@@ -1091,7 +1336,37 @@ class Generator:
 
         # Defrag. Physical page indices can only be compacted when no active block tables are using them.
         if num_jobs and not self.num_remaining_jobs():
-            self.pagetable.defrag()
+            self.on_queue_drained()
+
+
+    def reap_failed_job(self, job, error, results: list):
+        """
+        Contain a per-job failure so the generator stays usable for other jobs: release the
+        failed job's pages and recurrent state, drop it from the active set, and append an
+        error result carrying the standard serial/stage/eos fields. The async wrapper
+        delivers the raw exception to that job's consumer only (AsyncJob.__aiter__ re-raises
+        queued exceptions) and the sync generate() API raises it, instead of the failure
+        escaping to _run_iteration, which latches AsyncGenerator.error permanently and kills
+        the iteration task for every job.
+        """
+        try:
+            job.deallocate_pages()
+        except Exception:
+            logger.error(
+                "reap_failed_job: deallocate_pages() raised while cleaning up failed "
+                "job %s; pages or recurrent state may be stranded",
+                job,
+                exc_info = True,
+            )
+        if job in self.active_jobs:
+            self.active_jobs.remove(job)
+        results.append({
+            "job": job,
+            "serial": job.serial_number,
+            "stage": "error",
+            "eos": True,
+            "error": error,
+        })
 
 
     def iterate_start_jobs(self, results: list):
@@ -1136,7 +1411,11 @@ class Generator:
                 job.activate()
 
                 # Allocate pages for job
-                job.allocate_pages()
+                try:
+                    job.allocate_pages()
+                except Exception as e:
+                    self.reap_failed_job(job, e, results)
+                    continue
                 current_max_batch += len(job.sequences)
 
                 r = {
@@ -1321,6 +1600,12 @@ class Generator:
 
             for r in results:
                 idx = order[r["serial"]]
+                if r["stage"] == "error":
+                    # A per-job failure was contained by reap_failed_job; surface the
+                    # original exception to this caller rather than returning a silently
+                    # truncated completion. Jobs from the same batch that are still in
+                    # flight are left to the generator's normal queue handling.
+                    raise r["error"]
                 if r["stage"] == "streaming":
                     text = r.get("text", "")
                     completions[idx] += text

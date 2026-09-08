@@ -131,6 +131,10 @@ class Cache:
             If layer_type == CacheLayer_quant, bits per element of the quantized values tensor
         """
         self.model = model
+        # Set by Model.load() / cleared by Model.unload(): cache tensors are allocated by the
+        # model loader (per layer, on the layer's device), so a cache is only usable after a
+        # load of the model it was attached to at load time.
+        self.initialized = False
         self.config = model.config
         self.max_num_tokens = max_num_tokens
 
@@ -143,9 +147,15 @@ class Cache:
         self.num_layers = len(cl)
         self.layers = {}
         for attn in cl:
+            # Attention variants with a different cache geometry (MLA stores one latent plus one
+            # shared rope key instead of per-head K/V) map the requested layer type to their own
+            layer_type, layer_kwargs = (
+                attn.cache_layer_type(self.layer_type, kwargs)
+                if hasattr(attn, "cache_layer_type") else (self.layer_type, kwargs)
+            )
             for instance in self.model.get_layer_instances(attn.layer_idx):
                 self.layers[instance] = \
-                    self.layer_type(self.config, attn, id(self), self.max_num_tokens, **kwargs)
+                    layer_type(self.config, attn, id(self), self.max_num_tokens, **layer_kwargs)
 
         # Attach recurrent (SWA/linear-attn) layers
         self.num_slots = max_batch_size
@@ -361,6 +371,13 @@ class Cache:
         Return state to the pool
         """
         self.free_list.appendleft(state.slot)
+
+
+    def reset_states(self):
+        """
+        Return every state slot to the pool. A Generator calls this when it takes ownership of the cache.
+        """
+        self.free_list = deque(range(self.num_slots))
 
 
     def get_recurrent_layer(

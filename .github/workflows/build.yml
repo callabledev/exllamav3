@@ -1,4 +1,5 @@
 name: Build Wheels & Release
+run-name: Build Wheels & Release (${{ inputs.target }}, release=${{ inputs.release }})
 
 on:
   workflow_dispatch:
@@ -8,75 +9,92 @@ on:
         default: '0'
         required: true
         type: string
+      target:
+        description: 'Build target'
+        default: 'all'
+        required: true
+        type: choice
+        options:
+          - all
+          - windows
+          - windows_smoke
+          - cu132
+          - sdist
 
 permissions:
   contents: write
 
 jobs:
+  # The wheel matrix is generated here rather than declared statically on build_wheels because
+  # the `target` filter needs matrix values in a condition, and the matrix context is not
+  # available in job-level `if` expressions.
+  define_matrix:
+    name: Define build matrix
+    runs-on: ubuntu-22.04
+    if: inputs.target != 'sdist'
+    outputs:
+      matrix: ${{ steps.set_matrix.outputs.matrix }}
+    steps:
+      - name: Define matrix
+        id: set_matrix
+        shell: python
+        run: |
+          import itertools
+          import json
+          import os
+
+          target = "${{ inputs.target }}"
+
+          oses = ["ubuntu-22.04", "windows-2022"]
+          pyvers = ["3.10", "3.11", "3.12", "3.13.3", "3.14"]
+          torches = ["2.7.0", "2.8.0", "2.9.0", "2.10.0", "2.11.0"]
+          cudaarch = "8.0 8.6 8.9 9.0 10.0 12.0+PTX"
+
+          combos = []
+
+          # CUDA 12.8 wheels: full OS x Python x Torch product
+          for os_, pyver, torch in itertools.product(oses, pyvers, torches):
+              # No Torch 2.11 wheels for Python 3.10/3.11
+              if torch == "2.11.0" and pyver in ("3.10", "3.11"):
+                  continue
+              # Python 3.14 only builds Torch 2.9+
+              if pyver == "3.14" and torch in ("2.7.0", "2.8.0"):
+                  continue
+              combos.append(dict(os = os_, pyver = pyver, cuda = "12.8.1", rocm = "", torch = torch, cudaarch = cudaarch))
+
+          # CUDA 13.2 wheels are only built for Python 3.12+ with Torch 2.11
+          for os_, pyver in itertools.product(oses, ["3.12", "3.13.3", "3.14"]):
+              combos.append(dict(os = os_, pyver = pyver, cuda = "13.2.0", rocm = "", torch = "2.11.0", cudaarch = cudaarch))
+
+          if target == "windows":
+              combos = [c for c in combos if c["os"] == "windows-2022"]
+          elif target == "windows_smoke":
+              # Single Windows compile check: one modern combo, one CUDA arch (the wheel is a
+              # build-validation artifact, never released, so arch coverage doesn't matter and
+              # dropping it cuts most of the nvcc time). Upload steps skip this target
+              # regardless of the release input.
+              combos = [dict(os = "windows-2022", pyver = "3.12", cuda = "12.8.1", rocm = "",
+                             torch = "2.11.0", cudaarch = "8.6")]
+          elif target == "cu132":
+              combos = [c for c in combos if c["cuda"] == "13.2.0"]
+
+          print(f"{len(combos)} jobs:")
+          for c in combos:
+              print(f"  {c['os']} P{c['pyver']} CUDA {c['cuda']} T{c['torch']}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": combos}) + "\n")
+
   build_wheels:
     name: ${{ matrix.os }} P${{ matrix.pyver }} CUDA ${{ matrix.cuda }} T${{ matrix.torch }}
+    needs: define_matrix
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: pwsh
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, windows-2022]
-        pyver: ['3.10', '3.11', '3.12', '3.13.3', '3.14']
-        cuda: ['12.8.1']
-        rocm: ['']
-        torch: ['2.7.0', '2.8.0', '2.9.0', '2.10.0', '2.11.0']
-        cudaarch: ['8.0 8.6 8.9 9.0 10.0 12.0+PTX']
-        include:
-          # CUDA 13.2 wheels are only built for Python 3.13/3.14 with Torch 2.11.
-          - os: ubuntu-22.04
-            pyver: '3.12'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-          - os: windows-2022
-            pyver: '3.12'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-          - os: ubuntu-22.04
-            pyver: '3.13.3'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-          - os: windows-2022
-            pyver: '3.13.3'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-          - os: ubuntu-22.04
-            pyver: '3.14'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-          - os: windows-2022
-            pyver: '3.14'
-            cuda: '13.2.0'
-            rocm: ''
-            torch: '2.11.0'
-            cudaarch: '8.0 8.6 8.9 9.0 10.0 12.0+PTX'
-        exclude:
-          # No Torch 2.11 wheels for Python 3.10/3.11.
-          - pyver: '3.10'
-            torch: '2.11.0'
-          - pyver: '3.11'
-            torch: '2.11.0'
-          # Python 3.14 only builds Torch 2.9+.
-          - pyver: '3.14'
-            torch: '2.7.0'
-          - pyver: '3.14'
-            torch: '2.8.0'
+      matrix: ${{ fromJSON(needs.define_matrix.outputs.matrix) }}
 
     steps:
       - name: Free Disk Space
@@ -311,7 +329,7 @@ jobs:
           $pytorchIndexUrl = "https://download.pytorch.org/whl/cu$cudaVersionPytorch"
 
           uv pip install torch==${{ matrix.torch }} --index-url $pytorchIndexUrl
-          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+          uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
 
       - name: Compute Torch requirement pin
         id: dep_pins
@@ -323,7 +341,7 @@ jobs:
           Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_OUTPUT"
           Write-Output "TORCH_SPEC=$torchSpec" >> "$env:GITHUB_ENV"
 
-      - name: Patch setup.py dependency metadata for this wheel
+      - name: Patch pyproject.toml dependency metadata for this wheel
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -332,26 +350,26 @@ jobs:
           import os
           import re
 
-          setup_py = Path("setup.py")
-          text = setup_py.read_text(encoding="utf-8")
+          project_toml = Path("pyproject.toml")
+          text = project_toml.read_text(encoding="utf-8")
 
           torch_spec = os.environ["TORCH_SPEC"]
 
           text, torch_count = re.subn(
-              r'(["\'])torch>=2\.6\.0\1',
+              r'"torch>=2\.6\.0"',
               f'"torch{torch_spec}"',
               text,
               count=1,
           )
           if torch_count != 1:
-              raise SystemExit("Expected to replace exactly one torch>=2.6.0 requirement in setup.py")
+              raise SystemExit("Expected to replace exactly one torch>=2.6.0 requirement in pyproject.toml")
 
-          setup_py.write_text(text, encoding="utf-8")
-          print(f"Pinned setup.py requirements: torch{torch_spec}")
+          project_toml.write_text(text, encoding="utf-8")
+          print(f"Pinned pyproject.toml requirements: torch{torch_spec}")
           '@
 
-          Set-Content -Path patch_setup_deps.py -Value $patchScript -Encoding UTF8
-          python patch_setup_deps.py
+          Set-Content -Path patch_pyproject_deps.py -Value $patchScript -Encoding UTF8
+          python patch_pyproject_deps.py
 
       - name: Build for CUDA
         if: matrix.cuda != ''
@@ -402,7 +420,11 @@ jobs:
               print(line)
               req_text = line.removeprefix("Requires-Dist:").strip()
               req = Requirement(req_text)
-              actual[canonicalize_name(req.name)] = req
+              # Only unconditional requirements (no marker) belong to the package's base
+              # dependency set. Optional-dependency markers (extra == "cuXXX") are handled
+              # elsewhere and would otherwise overwrite the base requirement below.
+              if req.marker is None:
+                  actual[canonicalize_name(req.name)] = req
 
           for name, expected_req in expected.items():
               key = canonicalize_name(name)
@@ -423,7 +445,7 @@ jobs:
           python verify_wheel_metadata.py
 
       - name: Upload wheel files to GitHub release
-        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1'
+        if: steps.package_version.outputs.PACKAGE_VERSION != 'None' && inputs.release == '1' && inputs.target != 'windows_smoke'
         uses: svenstaro/upload-release-action@2.6.1
         with:
           file: ./dist/*.whl
@@ -432,8 +454,18 @@ jobs:
           overwrite: true
           release_name: ${{ steps.package_version.outputs.PACKAGE_VERSION }}
 
+      # Smoke builds never publish; the wheel lands as a workflow artifact instead so it can
+      # still be pulled onto a Windows machine for a manual import/functional check
+      - name: Upload wheel as workflow artifact (smoke build)
+        if: inputs.target == 'windows_smoke'
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-wheel-py${{ matrix.pyver }}-cu${{ matrix.cuda }}-torch${{ matrix.torch }}
+          path: dist/*.whl
+
   build_sdist:
     name: sdist
+    if: inputs.target == 'all' || inputs.target == 'sdist'
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -462,7 +494,7 @@ jobs:
       - name: Build sdist and py3-none-any JIT wheel
         run: |
           uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cpu
-          uv pip install --upgrade build setuptools==69.5.1 wheel packaging ninja safetensors tokenizers numpy
+          uv pip install --upgrade build "setuptools==84.0.0" wheel packaging ninja safetensors tokenizers numpy
 
           # Build both:
           #   - exllamav3-<version>.tar.gz

@@ -102,8 +102,8 @@ uint64_t mgemm_autotune_hash
         h ^= v;
         h *= 1099511628211ull;
     };
-    mix((uint64_t) bszm_in);
-    mix((uint64_t) bszm_out);
+    mix((uint64_t) MIN(bszm_in, 24));
+    mix((uint64_t) MIN(bszm_out, 24));
     return h;
 }
 
@@ -371,7 +371,10 @@ or q = j otherwise. This supports the following modes:
 - Expert-range filtering: with min_index >= 0, selections outside
   [min_index, max_index) are removed and retained indices are rebased by
   min_index. This allows B/suh/svh to be local pointer tables for an expert
-  shard. Weights are compacted in the same order.
+  shard. At num_tokens == 1 the retained indices (and their weights) are
+  compacted; at num_tokens > 1 out-of-range slots are instead masked to -1 in
+  place, preserving the per-token slot groups the final reduction depends on
+  (and, with bszm_in > 1, the slot -> input-row correspondence).
 
 Without weights, every active C[j] is a separate output. The active slot count
 is max(a_batches, c_batches), capped to num_indices when indices is present.
@@ -397,11 +400,18 @@ int exl3_mgemm_gr
     int min_index,
     int max_index,
     int force_num_sms,
-    Graph* graph
+    Graph* graph,
+    int num_tokens,
+    const c10::optional<at::Tensor>& size_n_list,
+    const c10::optional<at::Tensor>& c_ptrs
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(A.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    // num_tokens > 1 with expert-range filtering (min_index >= 0) uses position-preserving
+    // masking in the kernel (out-of-range slots marked -1 in place) instead of index
+    // compaction, so the grouped reduction's fixed per-token slot runs stay intact
 
     TORCH_CHECK_DTYPE(A, kHalf);
     TORCH_CHECK_DTYPE(B, kLong);
@@ -422,9 +432,30 @@ int exl3_mgemm_gr
     int bsz = A.size(1);
     int bszm_in = A.size(0);
     int bszm_out = C.size(0);
+
+    // Per-matrix output widths/pointers (uniform-width callers pass neither): C then only
+    // provides the dtype and the max width (locks/shape sizing); outputs go to c_ptrs
+    const int* size_n_list_ptr = nullptr;
+    void** c_list_ptr = nullptr;
+    if (size_n_list)
+    {
+        TORCH_CHECK(c_ptrs, "exl3_mgemm: size_n_list requires c_ptrs");
+        TORCH_CHECK_DTYPE(size_n_list.value(), kInt);
+        TORCH_CHECK_DTYPE(c_ptrs.value(), kLong);
+        TORCH_CHECK(num_tokens == 1 && min_index < 0 && !weights,
+                    "exl3_mgemm: per-matrix widths incompatible with multi-token/filtering/weights");
+        size_n_list_ptr = (const int*) size_n_list.value().data_ptr();
+        c_list_ptr = (void**) c_ptrs.value().data_ptr();
+        bszm_out = (int) c_ptrs.value().size(0);
+    }
     int bszm = MAX(bszm_in, bszm_out);
 
-    const long* indices_ptr = (const long*) OPTPTR(indices);
+    // The kernel writes one hadamard-transformed input slab PER MATRIX (A_had + j * m * k);
+    // an undersized scratch is silent OOB corruption (found the hard way)
+    TORCH_CHECK(A_had.numel() >= (int64_t) bszm * A.size(1) * A.size(2),
+                "exl3_mgemm: A_had must hold bszm * m * k elements");
+
+    const int64_t* indices_ptr = (const int64_t*) OPTPTR(indices);
     const half* weights_ptr = (const half*) OPTPTR(weights);
 
     if (indices)
@@ -489,7 +520,10 @@ int exl3_mgemm_gr
         (void*)& bszm_in,
         (void*)& bszm_out,
         (void*)& min_index,
-        (void*)& max_index
+        (void*)& max_index,
+        (void*)& num_tokens,
+        (void*)& size_n_list_ptr,
+        (void*)& c_list_ptr
     };
 
     auto add_graph_args = [&](void* kernel_ptr)
@@ -613,7 +647,10 @@ int exl3_mgemm
     uint32_t mul1_mult,
     int min_index,
     int max_index,
-    int force_num_sms
+    int force_num_sms,
+    int num_tokens,
+    const c10::optional<at::Tensor>& size_n_list,
+    const c10::optional<at::Tensor>& c_ptrs
 )
 {
     return exl3_mgemm_gr
@@ -633,6 +670,9 @@ int exl3_mgemm
         min_index,
         max_index,
         force_num_sms,
-        nullptr
+        nullptr,
+        num_tokens,
+        size_n_list,
+        c_ptrs
     );
 }

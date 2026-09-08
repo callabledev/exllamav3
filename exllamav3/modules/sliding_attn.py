@@ -191,8 +191,8 @@ class SWALayerState:
 
 
     def alloc(self, device):
-        self.k_state = torch.empty_like(self.k_state, device = device)
-        self.v_state = torch.empty_like(self.v_state, device = device)
+        self.k_state = torch.zeros_like(self.k_state, device = device)
+        self.v_state = torch.zeros_like(self.v_state, device = device)
         self.device = device
 
 
@@ -230,6 +230,8 @@ class SWALayerState:
         b = min(self.module.kv_state_size, position)
         a = max(0, b - self.module.sliding_window)
         k, v = stashed
+        self.k_state[slot].zero_()
+        self.v_state[slot].zero_()
         self.k_state[slot, a:b].copy_(k)
         self.v_state[slot, a:b].copy_(v)
 
@@ -266,12 +268,14 @@ class SlidingAttention(Module):
         v_proj: Linear | Module | None = None,
         o_proj: Linear | Module | None = None,
         g_proj: Linear | Module | None = None,
-        post_rope_norm: bool = False,
         full_gate: bool = False,
+        gate_softplus: bool = False,
         select_hq_bits: int = 0,
     ):
         super().__init__(config, key, None)
         assert sliding_window > 0
+        assert not gate_softplus or not full_gate, \
+            "SlidingAttention: gate_softplus is only implemented for the headwise gate"
 
         self.q_priority = 2 + select_hq_bits
         self.layer_idx = layer_idx
@@ -291,8 +295,8 @@ class SlidingAttention(Module):
         # so round UP to whole pages to preserve at least the requested slack after a shift
         self.kv_state_size = -(-(sliding_window + sliding_window_overp) // PAGE_SIZE) * PAGE_SIZE
         self.logit_softcapping = logit_softcapping
-        self.post_rope_norm = post_rope_norm
         self.full_gate = full_gate
+        self.gate_softplus = gate_softplus
         self.bt_cache = {}
 
         # Set before the zero-heads early return: forward()/unload() and the TP import touch these
@@ -315,10 +319,6 @@ class SlidingAttention(Module):
         self.key_sinks = key_sinks
         self.sinks = None
 
-        if post_rope_norm:
-            assert q_norm is None and k_norm is None, \
-                "Post-RoPE norm only supported without weights"
-
         if self.num_kv_heads == 0:
             return
 
@@ -337,6 +337,7 @@ class SlidingAttention(Module):
                 frange = frange_q,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                trim_padded_out = True,
             )
             self.register_submodule(self.q_proj)
         else:
@@ -355,6 +356,7 @@ class SlidingAttention(Module):
                 frange = frange_k,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                trim_padded_out = True,
             )
             self.v_proj = Linear(
                 config,
@@ -366,6 +368,7 @@ class SlidingAttention(Module):
                 frange = frange_v,
                 select_hq_bits = select_hq_bits,
                 qgroup = key + ".qkv",
+                trim_padded_out = True,
             )
             self.register_submodule(self.k_proj)
             self.register_submodule(self.v_proj)
@@ -496,10 +499,12 @@ class SlidingAttention(Module):
             self.config.infer_params.use_mgemm(
                 self.k_proj.inner.K, self.k_proj.out_features,
                 self.k_proj.inner.mul1 and self.v_proj.inner.mul1,
+                device,
             )
         ):
             self.multi_kv = MultiLinear(self. device, [self.k_proj, self.v_proj])
-            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "kvh_1")
+            # Staging buffers span the padded K, not hidden_size (see attn.py)
+            self.prealloc_kvh_1 = g_tensor_cache.get(device, (2, 1, self.k_proj.in_features), torch.half, "kvh_1")
             self.prealloc_kv_1 = g_tensor_cache.get(device, (2, 1, self.num_kv_heads * self.head_dim), torch.half, "kv_1")
 
         # Test if Q and G proj can be fused
@@ -516,16 +521,24 @@ class SlidingAttention(Module):
             self.config.infer_params.use_mgemm(
                 self.q_proj.inner.K, self.q_proj.out_features,
                 self.q_proj.inner.mul1 and self.g_proj.inner.mul1,
+                device,
             )
         ):
             self.multi_qg = MultiLinear(self. device, [self.q_proj, self.g_proj])
-            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.hidden_size), torch.half, "qgh_1")
+            self.prealloc_qgh_1 = g_tensor_cache.get(device, (2, 1, self.q_proj.in_features), torch.half, "qgh_1")
             self.prealloc_qg_1 = g_tensor_cache.get(device, (2, 1, self.num_q_heads * self.head_dim), torch.half, "qg_1")
 
         # Head norm
         if self.q_norm and isinstance(self.q_norm, RMSNorm) and not self.q_norm.span_heads:
-            self.q_norm_tensor = self.q_norm.weight.data
-            self.k_norm_tensor = self.k_norm.weight.data
+            if self.q_norm.unweighted:
+                # Unweighted head norm == weighted norm with all-ones scale; synthesize the weight so
+                # the fused rope+norm kernel and the BC graph path still apply
+                ones = torch.ones(self.head_dim, dtype = torch.half, device = device)
+                self.q_norm_tensor = ones
+                self.k_norm_tensor = ones
+            else:
+                self.q_norm_tensor = self.q_norm.weight.data
+                self.k_norm_tensor = self.k_norm.weight.data
 
 
 
@@ -539,6 +552,8 @@ class SlidingAttention(Module):
     def unload(self):
         super().unload()
 
+        for rl in self.recurrent_layers:
+            rl.free()
         self.bc_attn = {}
         self.rope = None
         self.sinks = None
@@ -608,12 +623,16 @@ class SlidingAttention(Module):
             else:
                 g = None
         else:
-            x = x.view(1, bsz * q_len, dim)
+            # The fused path doesn't zero-extend the input for padded in_features: do it here (K is the
+            # padded width the mgemm kernel reads)
+            if x.shape[-1] < self.q_proj.in_features:
+                x = torch.nn.functional.pad(x, (0, self.q_proj.in_features - x.shape[-1]))
+            x = x.view(1, bsz * q_len, self.q_proj.in_features)
             if bsz * q_len == 1:
                 qgh = self.prealloc_qgh_1
                 qg = self.prealloc_qg_1
             else:
-                qgh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                qgh = torch.empty((2, bsz * q_len, self.q_proj.in_features), dtype = torch.half, device = x.device)
                 qg = torch.empty((2, bsz * q_len, self.num_q_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
@@ -630,8 +649,8 @@ class SlidingAttention(Module):
                 self.multi_qg.mul1,
                 -1,
                 -1,
-                0
-            )
+                0,
+                1, None, None)
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
@@ -640,12 +659,14 @@ class SlidingAttention(Module):
             v = self.v_proj.forward(x, params)
 
         else:
-            x = x.view(1, bsz * q_len, dim)
+            if x.shape[-1] < self.k_proj.in_features:
+                x = torch.nn.functional.pad(x, (0, self.k_proj.in_features - x.shape[-1]))
+            x = x.view(1, bsz * q_len, self.k_proj.in_features)
             if bsz * q_len == 1:
                 kvh = self.prealloc_kvh_1
                 kv = self.prealloc_kv_1
             else:
-                kvh = torch.empty((2, bsz * q_len, dim), dtype = torch.half, device = x.device)
+                kvh = torch.empty((2, bsz * q_len, self.k_proj.in_features), dtype = torch.half, device = x.device)
                 kv = torch.empty((2, bsz * q_len, self.num_kv_heads * self.head_dim), dtype = torch.half, device = x.device)
             ext.exl3_mgemm(
                 x,
@@ -662,8 +683,8 @@ class SlidingAttention(Module):
                 self.multi_kv.mul1,
                 -1,
                 -1,
-                0
-            )
+                0,
+                1, None, None)
             k = kv[0].view(bsz, q_len, self.num_kv_heads * self.head_dim)
             v = kv[1].view(bsz, q_len, self.num_kv_heads * self.head_dim)
 
@@ -773,7 +794,6 @@ class SlidingAttention(Module):
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
-                self.post_rope_norm
             )
 
         o = paged_attn_triton_prefill(
@@ -787,7 +807,9 @@ class SlidingAttention(Module):
             v_new = v,
         )
 
-        if self.headwise_gate: o *= g.sigmoid().unsqueeze(-1)
+        if self.headwise_gate:
+            if self.gate_softplus: o *= torch.nn.functional.softplus(g.float()).to(o.dtype).unsqueeze(-1)
+            else: o *= g.sigmoid().unsqueeze(-1)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate: o *= g.sigmoid()
         o = self.project_o(o, bsz, seqlen, params)
@@ -838,7 +860,6 @@ class SlidingAttention(Module):
                 self.norm_eps,
                 self.norm_constant_bias,
                 inv_freq,
-                self.post_rope_norm
             )
 
         # Recurrent state: a short contiguous fp16 K/V span per sequence, viewed as a paged
@@ -950,7 +971,9 @@ class SlidingAttention(Module):
                         k_states[rs.slot, : seqlen - skip].copy_(k[i, skip:])
                         v_states[rs.slot, : seqlen - skip].copy_(v[i, skip:])
 
-        if self.headwise_gate: ext.mul_sigmoid_broadcast_(o, g)
+        if self.headwise_gate:
+            if self.gate_softplus: ext.mul_softplus_broadcast_(o, g)
+            else: ext.mul_sigmoid_broadcast_(o, g)
         o = o.view((bsz, seqlen, self.num_q_heads * self.head_dim))
         if self.full_gate: ext.mul_sigmoid_(o, g)
 
@@ -1025,8 +1048,8 @@ class SlidingAttention(Module):
                 "sliding_window": self.sliding_window,
                 "sliding_window_overp": self.sliding_window_overp,
                 "logit_softcapping": self.logit_softcapping,
-                "post_rope_norm": self.post_rope_norm,
                 "full_gate": self.full_gate,
+                "gate_softplus": self.gate_softplus,
             },
             "num_kv_heads": self.num_kv_heads,
             "n_gqa": self.num_q_heads // self.num_kv_heads,

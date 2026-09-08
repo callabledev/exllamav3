@@ -12,6 +12,8 @@ def add_args(
     parser: ArgumentParser,
     cache: bool = True,
     default_cache_size = 8192,
+    default_recurrent_cache_size = 4.0,
+    default_cpu_cache_size = 0.0,
     add_sampling_args: bool = False,
     default_sampling_args: dict = None,
     default_autosplit_max_batch_size: int = 1,
@@ -28,6 +30,12 @@ def add_args(
 
     :param default_cache_size:
         Default value for -cs / --cache_size argument
+
+    :param default_recurrent_cache_size:
+        Default value for -rcs / --recurrent_cache_size argument
+
+    :param default_cpu_cache_size:
+        Default value for -ccs / --cpu_cache_size argument
 
     :param add_sampling_args:
         bool, add sampling arguments
@@ -47,6 +55,10 @@ def add_args(
     parser.add_argument("-or", "--override", type = str, help = "Tensor override spec (YAML)", default = None)
 
     parser.add_argument("-tp", "--tensor_parallel", action = "store_true", help = "Load model in Tensor-parallel mode, attempts to respect --gpu_split")
+    parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
+    parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
+    parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else cpu_count/2)", default = None)
+    parser.add_argument("-ngr", "--ngram_ram", action = "store_true", help = "Load an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) fully into system RAM instead of streaming rows from disk per forward (tens of GB of RAM; avoids per-token disk reads)")
     parser.add_argument("-tpb", "--tp_backend", type = str, help = "Tensor-parallel backend, either 'native' (default) or 'nccl'", default = "native")
     parser.add_argument("-tp_attn", "--tp_max_parallelism_attn", type = int, help = "(TP) Maximum parallelism for attention layers", default = None)
     parser.add_argument("-tp_mlp", "--tp_max_parallelism_mlp", type = int, help = "(TP) Maximum parallelism for MLP layers", default = None)
@@ -92,7 +104,8 @@ def add_args(
         parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
         parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
-
+        parser.add_argument("-ccs", "--cpu_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_cpu_cache_size}", default = default_cpu_cache_size)
+        parser.add_argument("-rcs", "--recurrent_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_recurrent_cache_size}", default = default_recurrent_cache_size)
 
     if add_draft_model_args:
         parser.add_argument("-dm", "--draft_model_dir", type = str, help = "Path to draft model directory", default = None)
@@ -100,7 +113,8 @@ def add_args(
         parser.add_argument("-mtp", "--mtp", action = "store_true", help = "Use MTP drafting")
         parser.add_argument("-ngram", "--ngram_match_min", type = int, help = "N-gram draft minimum match length, default = 0 (disabled)", default = 0)
         parser.add_argument("-dds", "--dynamic_draft", action = "store_true", help = "Dynamically adapt draft length to acceptance rate (num_draft_tokens acts as ceiling)")
-        parser.add_argument("-dskip", "--draft_skip_ema", type = float, help = "Skip drafting while EMA below this threshold (0 = disabled, default: 0.3)", default = 0.3)
+        parser.add_argument("-dc", "--draft_confidence", type = float, help = "Confidence target for dynamic draft truncation, default: 0.4", default = 0.4)
+        parser.add_argument("-dmcl", "--draft_moe_cpu_layers", type = int, help = "Experimental: like --moe_cpu_offload, but for the draft model (or MTP head)", default = 0)
 
 
 def get_arg_sampler(args):
@@ -184,11 +198,35 @@ def init(
 
     # Config
     config = Config.from_directory(args.model_dir, layer_map = args.layer_map)
+    if getattr(args, "moe_cpu_offload", 0):
+        assert not args.tensor_parallel, "--moe_cpu_offload currently requires layer-split mode"
+        config.infer_params.moe_cpu_offload = args.moe_cpu_offload
+    if getattr(args, "moe_cpu_split", 0):
+        assert not args.tensor_parallel, "--moe_cpu_split currently requires layer-split mode"
+        assert not getattr(args, "moe_cpu_offload", 0), "--moe_cpu_split and --moe_cpu_offload are mutually exclusive"
+        config.infer_params.moe_cpu_split = args.moe_cpu_split
+    if getattr(args, "moe_cpu_threads", None) is not None:
+        config.infer_params.moe_cpu_threads = args.moe_cpu_threads
+    if getattr(args, "ngram_ram", False):
+        config.infer_params.ngram_stream_from_disk = False
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
+    dmcl = getattr(args, "draft_moe_cpu_layers", 0)
+    dmclt = getattr(args, "moe_cpu_threads", None)
+    if dmcl:
+        assert not args.tensor_parallel, "--draft_moe_cpu_layers currently requires layer-split mode"
+        assert draft_model_dir, "--draft_moe_cpu_layers requires a draft model (or --mtp)"
     if use_mtp:
         draft_config = config
+        # Shared config: the MTP head is a separate component with its own budget and worker
+        config.infer_params.draft_moe_cpu_offload = dmcl
+        if dmclt is not None:
+            config.infer_params.draft_moe_cpu_threads = dmclt
     elif draft_model_dir:
         draft_config = Config.from_directory(draft_model_dir)
+        # Separate config: the draft model's own text component takes the budget
+        draft_config.infer_params.moe_cpu_offload = dmcl
+        if dmclt is not None:
+            draft_config.infer_params.moe_cpu_threads = dmclt
     else:
         draft_config = None
 

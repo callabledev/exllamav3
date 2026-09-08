@@ -68,8 +68,15 @@ class Model(Model_TPMixin, Model_LSMixin):
     @cached_property
     def _get_recurrent_layers(self):
         return [m for m in self if m.caps.get("recurrent_cache")]
+
     def get_recurrent_layers(self):
         return self._get_recurrent_layers
+
+    @cached_property
+    def _get_prefetch_layers(self):
+        # modules that stage input-dependent data (PLE n-gram rows) on a worker thread before the
+        # first layers are issued, so the gather overlaps block 0 instead of stalling at its layer
+        return [m for m in self if m.caps.get("prefetch_ids")]
 
 
     def get_layer_instances(self, layer_idx):
@@ -167,6 +174,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             f"{config.architecture} does not define a '{component}' component model"
 
         model = config.model_classes[component](config, **kwargs)
+        model.component = component
 
         # Compile layer map after model is constructed (before any caches are attached)
         model.prepare_layer_map()
@@ -176,10 +184,6 @@ class Model(Model_TPMixin, Model_LSMixin):
     def prepare_inputs(self, input_ids: torch.Tensor, params: dict) -> torch.Tensor:
         # Overridden by model arch class
         raise NotImplementedError()
-
-
-    def per_layer_quant_preamble(self, params: dict):
-        pass
 
 
     @torch.inference_mode
@@ -200,6 +204,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             advance_recurrent_states(input_ids, params, self)
             return y
         else:
+            for m in self._get_prefetch_layers:
+                m.prefetch(x, params)
             y = self.prefill_ls(x, params)
             advance_recurrent_states(input_ids, params, self)
             return y
@@ -223,6 +229,8 @@ class Model(Model_TPMixin, Model_LSMixin):
             advance_recurrent_states(input_ids, params, self)
             return y
         else:
+            for m in self._get_prefetch_layers:
+                m.prefetch(x, params)
             y = self.forward_ls(x, params)
             advance_recurrent_states(input_ids, params, self)
             return y
@@ -231,9 +239,16 @@ class Model(Model_TPMixin, Model_LSMixin):
     def unload(self):
         for module in self.modules:
             module.unload()
+        # The loader's open slab blocks must not outlive the tensors sliced from them
+        self.config.stc.release_arena()
         self.active_devices = []
         self.unload_tp()
         self.output_device = None
+        # Attached caches lose their layer tensors with the modules that allocated them
+        for ref in self.cache_weakrefs.values():
+            cache = ref()
+            if cache is not None:
+                cache.initialized = False
 
 
     def load_gen(
@@ -348,6 +363,10 @@ class Model(Model_TPMixin, Model_LSMixin):
 
         free_mem()
 
+        # Route CPU-offloaded MoE layers to this component's own worker and budget (an MTP head
+        # shares the config but loads after the main model's worker has already started)
+        self.config.infer_params.moe_cpu_component = getattr(self, "component", "text")
+
         assert not (bool(reserve_per_device) and bool(use_per_device)), \
             "Cannot specify both memory usage and memory reserve."
 
@@ -362,6 +381,7 @@ class Model(Model_TPMixin, Model_LSMixin):
             assert not tensor_p, \
                 "Cannot use tensor_p when loading to single device."
             self._load_single(progressbar, device, self.config, self.modules, verbose)
+            self.output_device = self.modules[-1].device
 
         # Use/reserve
         else:
@@ -459,6 +479,12 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Release all global shared tensors (refs still held by modules until model is unloaded)
         g_tensor_cache.drop_all()
 
+        # Mark every attached cache usable.
+        for ref in self.cache_weakrefs.values():
+            cache = ref()
+            if cache is not None:
+                cache.initialized = True
+
 
     @torch.inference_mode
     def load(self, *args, **kwargs):
@@ -469,6 +495,13 @@ class Model(Model_TPMixin, Model_LSMixin):
         kwargs["generator"] = False
         f = self.load_gen(*args, **kwargs)
         for _ in f: pass
+
+        # CPU-offloaded MoE experts: make sure the worker processes are up before the first
+        # forward (spawned during module loading when the offload count is exact, so the child's
+        # weight loading overlaps the parent's; started here otherwise). ensure_started is
+        # idempotent, so already-running workers of other components are unaffected
+        for host in getattr(self.config, "moe_cpu_hosts", {}).values():
+            host.ensure_started()
 
 
     def get_load_metrics(self):

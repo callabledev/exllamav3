@@ -11,7 +11,6 @@ from ..util.rope import RopeStyle
 from ..modules import RMSNorm, Embedding, TransformerBlock, Attention, GatedMLP, Linear, BlockSparseMLP
 from ..modules.arch_specific.qwen3_5_mtp import Qwen3_5MTPInputLayer
 from ..modules.attn import prepare_for_attn
-from ..modules.module import no_p2p_copy
 from ..util.tensor import get_for_device
 
 from typing import TYPE_CHECKING
@@ -239,6 +238,13 @@ class Qwen3_5MTPModel(Model):
             lm = self.attached_model().modules[ll]
             logits = lm.prepare_for_device(state, params)
             logits = lm.forward(logits, params)
+            if params.get("export_draft_conf"):
+                # Per-position confidence for the generator's draft truncation: the argmax logit
+                # value, over the unpadded vocabulary
+                logits = logits[..., :self.attached_model().config.vocab_size]
+                conf, ids = torch.max(logits, dim = -1)
+                params["draft_conf"] = conf
+                return ids
             return torch.argmax(logits, dim = -1)
         else:
             state = self.attached_model().tp_producer.send(state)

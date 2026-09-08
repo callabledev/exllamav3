@@ -34,6 +34,23 @@ bool exl3_gemv_int8_enabled()
     return exl3_gemv_int8_mode() != 0;
 }
 
+// Highest K the int8 path accepts; above it the regular kernel wins. The fp16 pipeline must be
+// compute/latency-limited for the reduced per-weight work to matter, and where that ends is
+// per-arch. Ampere is DRAM-bound from K = 6 up (3090: int8 -29/-22/-9/-6% at K=2/3/4/5, then
+// -11..-26% on wide shapes at K=6); Ada is marginal at K=6 (4090: -0..+7%, residual mode loses)
+// and keeps the conservative gate. Hopper's fp16 kernel is per-SM INT-throughput-bound at K = 6
+// (H200, issue #242: +26/+57% per call, +16% e2e), and Blackwell measures the same way (5090:
+// +7..+19% at K=6 across shapes, fp16 kernel at only ~65-78% of DRAM peak; K=7/8 are flat).
+// EXL3_INT8_GEMV_MAX_K overrides the per-arch default for testing on unmeasured parts (kernel
+// instances exist up to K = 8; at m == 1, K = 7..8 fall through to the cooperative kernel)
+int exl3_gemv_int8_max_k(int device)
+{
+    static const int env_max_k = [] { const char* e = getenv("EXL3_INT8_GEMV_MAX_K"); return e ? atoi(e) : 0; }();
+    if (env_max_k) return MIN(env_max_k, 8);
+    int cc = DevCtx::instance().get_cc(device);
+    return (cc == CC_HOPPER || cc == CC_BLACKWELL) ? 6 : 5;
+}
+
 struct GemvInt8Workspace
 {
     int* ws = nullptr;
@@ -72,6 +89,7 @@ static void* select_gemv_int8_sq_kernel(int K, int M, bool c_fp32, bool residual
         case 3: return exl3_gemv_int8_sq_sel_k3(M, c_fp32, residual);
         case 4: return exl3_gemv_int8_sq_sel_k4(M, c_fp32, residual);
         case 5: return exl3_gemv_int8_sq_sel_k5(M, c_fp32, residual);
+        case 6: return exl3_gemv_int8_sq_sel_k6(M, c_fp32, residual);
     }
     return nullptr;
 }
@@ -182,6 +200,12 @@ static bool exl3_gemv_int8_sq
     };
 
     cudaError_t err = cudaLaunchKernel(fn, dim3(grid), dim3(NUM_THREADS), kernelArgs, smem, stream);
+    if (err != cudaSuccess)
+    {
+        // Nothing was captured: the caller's fallback kernel records its own parameter sites
+        cudaGetLastError();
+        return false;
+    }
     if (graph)
     {
         graph->record_param(fn, GP_gemm_A, 0);
@@ -191,11 +215,6 @@ static bool exl3_gemv_int8_sq
         graph->record_param(fn, GP_gemm_A_had, 8);
         graph->record_param(fn, GP_gemm_B_svh, 9);
         graph->record_param(fn, GP_end, 0);
-    }
-    if (err != cudaSuccess)
-    {
-        cudaGetLastError();
-        return false;
     }
     return true;
 }
@@ -220,13 +239,10 @@ bool exl3_gemv_int8
     int size_m = A.numel() / size_k;
     if (size_n % 256) return false;
     if (size_k % 128) return false;
-    // K >= 6 is DRAM-bound and the regular kernel reads the same bytes with less overhead; the int8
-    // path only wins where the fp16 pipeline is compute/latency-limited (measured 3090: -29/-22/-9/-6%
-    // at K=2/3/4/5, +5% at K=6)
-    if (K < 1 || K > GEMV_INT8_MAX_K) return false;
 
     int device;
     cudaGetDevice(&device);
+    if (K < 1 || K > exl3_gemv_int8_max_k(device)) return false;
     int num_sms = DevCtx::instance().get_num_sms(device);
     bool c_fp32 = C.dtype() == at::kFloat;
     bool residual = exl3_gemv_int8_mode() == 1;
@@ -330,13 +346,13 @@ bool exl3_gemv_int8
     };
 
     cudaError_t err = cudaLaunchCooperativeKernel(fn, grid, NUM_THREADS, kernelArgs, smem, stream);
-    add_graph_args((void*) fn);
-
     if (err != cudaSuccess)
     {
         // e.g. cooperative launch unsupported or co-residency violated: fall back to the regular kernel
+        // (which records its own graph parameter sites)
         cudaGetLastError();
         return false;
     }
+    add_graph_args((void*) fn);
     return true;
 }

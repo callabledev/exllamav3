@@ -17,6 +17,10 @@ namespace cg = cooperative_groups;
 #include "../avx2_target.h"
 #include "all_reduce_cpu_avx2.h"
 
+#ifndef __linux__
+#include <intrin.h>
+#endif
+
 // Schedule CPU reduce job. Called by master device proces in all_reduce_cpu and assumes all
 // CUDA streams have kernels scheduled at the same time
 void push_reduce_job
@@ -28,8 +32,10 @@ void push_reduce_job
 )
 {
     atomic_ref<uint32_t> tail_(&ctx->reduce_jobs_tail);
+    atomic_ref<uint32_t> head_(&ctx->reduce_jobs_head);
     uint32_t tail = tail_.load_acquire();
     uint32_t next = (tail + 1) % MAX_REDUCE_JOBS;
+    TORCH_CHECK(next != head_.load_acquire(), "push_reduce_job: CPU reduce job queue is full");
     ctx->reduce_jobs[tail] = ReduceJob{ data_size, device_mask, wire_dtype };
     tail_.store_release(next);
 }
@@ -103,7 +109,11 @@ void run_cpu_reduce_jobs
                 break;
             if (++spins < 65536)
             {
-                __builtin_ia32_pause();
+                #ifdef __linux__
+                    __builtin_ia32_pause();
+                #else
+                    _mm_pause();
+                #endif
                 continue;
             }
             std::this_thread::sleep_for(std::chrono::microseconds(50));

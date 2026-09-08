@@ -7,7 +7,6 @@ from ..constants import PAGE_SIZE
 import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
 from .filter import Filter
-import math
 import random
 import time
 from ..ext import exllamav3_ext as ext
@@ -21,6 +20,11 @@ from ..util import profile_opt
 # Convert list of strings to UTF32 format to pass by reference to partial matching function
 @lru_cache(100)
 def _strings_to_utf32(strings: tuple[str]) -> tuple[np.ndarray, np.ndarray] | None:
+    # An empty string occupies no range in the packed buffer, and the matcher has no terminator to
+    # stop it at: it would scan off the end of the buffer and can report a partial match that never
+    # resolves, holding output indefinitely. An empty needle cannot match anything meaningful in
+    # any case, so drop it here, where every caller passes through
+    strings = tuple(s for s in strings if s)
     if not strings: return bytearray(), None
 
     encoded_strings = [s.encode("utf-32-le") for s in strings]
@@ -67,11 +71,11 @@ class Job:
         Create new job.
 
         :param input_ids:
-            Tokenized IDs of the input prompt, shape (1, n). Alternatively, list of tokenized IDs to inference on
-            seperately but sample collectively (e.g. CFG prompt pair)
+            Tokenized IDs of the input prompt, shape (1, n) (a single-element list is also accepted). A job holds
+            exactly one sequence
 
         :param max_new_tokens:
-            Max no. output tokens to allow
+            Max no. output tokens to allow. None (default): no limit other than the cache capacity
 
         :param min_new_tokens:
             Minimum number of tokens to generate before stop tokens become active. Until this number have been
@@ -163,6 +167,17 @@ class Job:
         if sampler is None:
             sampler = DefaultSampler()
 
+        # Forced output injection (constrain_output_now). forced_ids holds tokens not yet sampled,
+        # forced_index the queue position, forced_sample marks the token currently in flight between
+        # receive_logits and receive_sample as forced. Suspended filters stay disabled for the
+        # remainder of the job (including requeues) since their state machines cannot track
+        # injected tokens.
+        self.forced_ids = rq_state.get("forced_ids")
+        self.forced_index = 0
+        self.forced_ids_device = None
+        self.forced_sample = False
+        self.filters_suspended = rq_state.get("filters_suspended", False)
+
         # Sampling state
         self.held_text = rq_state.get("held_text", "")
         self.held_tokens = rq_state.get("held_tokens")
@@ -192,9 +207,13 @@ class Job:
                 "input_ids must be [1, seq_len] tensor or list of [1, seq_len] tensors"
             seq = Sequence(ids, seq_ids)
             self.sequences.append(seq)
+        assert len(self.sequences) == 1, \
+            "A job holds exactly one sequence (multi-sequence jobs are not supported)"
 
         # Generation parameters
-        self.max_new_tokens = max_new_tokens - 1 or 1
+        assert max_new_tokens is None or max_new_tokens >= 1, "max_new_tokens must be >= 1, or None for no limit"
+        # None: no limit beyond what the cache can hold; resolved against the generator in prepare_for_queue
+        self.max_new_tokens = max_new_tokens
         self.min_new_tokens = min_new_tokens
         self.new_tokens = 0 if self.prefix_token is None else -1
         self.sampler = sampler
@@ -235,8 +254,6 @@ class Job:
 
         # Banned strings
         if banned_strings:
-            assert filters is None or len(filters) == 0, \
-                "Cannot combine banned strings with filters"
             self.banned_strings = [s.lower() for s in banned_strings]
             self.banned_strings_utf32_buffer, self.banned_strings_utf32_offsets = \
                 _strings_to_utf32(tuple(self.banned_strings))
@@ -256,10 +273,10 @@ class Job:
         self.time_enqueued = rq_state.get("time_enqueued", 0.0)
         self.time_prefill = rq_state.get("time_prefill", 0.0)
         self.time_generate = rq_state.get("time_generate", 0.0)
-        self.accepted_draft_tokens = 0
-        self.rejected_draft_tokens = 0
-        self.draft_ema = rq_state.get("draft_ema")
-        self.draft_skip_count = 0
+        self.accepted_draft_tokens = rq_state.get("accepted_draft_tokens", 0)
+        self.rejected_draft_tokens = rq_state.get("rejected_draft_tokens", 0)
+        self.rq_prompt_tokens = rq_state.get("prompt_tokens")
+        self.rq_cached = rq_state.get("cached")
         self.draft_stats = []
         self.cached_pages = 0
         self.cached_tokens = 0
@@ -272,6 +289,7 @@ class Job:
         self.filter_futures = []
         self.logit_masks = []
         self.pinned_logit_mask = None
+        self.pinned_logit_bitmask = None
         self.device_logit_mask = None
         self.logits_device = None
 
@@ -280,9 +298,11 @@ class Job:
         self.alt_rope_freqs = None
         self.alt_rope_offset = 0
 
-        # Pinned buffer for IDs during sampling
+        # Pinned buffer for IDs during sampling, and its device-resident copy for the current step
         self.current_pinned_ids = None
         self.pinned_ids = None  # Lazy alloc
+        self.current_device_ids = None
+        self.pinned_ids_valid = 0  # Leading tokens of pinned_ids known to match sequence_ids
 
         # Recurrent state
         self.recurrent_state = None
@@ -313,6 +333,28 @@ class Job:
                 pin_memory = True
             )
         return self.pinned_logit_mask
+
+
+    def get_pinned_logit_bitmask(self):
+        # padded_vocab_size is a multiple of 32, so the packed mask width is exact
+        if self.pinned_logit_bitmask is None:
+            self.pinned_logit_bitmask = torch.empty(
+                (1, self.generator.padded_vocab_size // 32),
+                dtype = torch.int32,
+                device = "cpu",
+                pin_memory = True
+            )
+        return self.pinned_logit_bitmask
+
+
+    def _expand_bitmask(self, bitmask: torch.Tensor) -> torch.Tensor:
+        # Expand a packed int32 bitmask to a dense additive half mask, for combining with dense
+        # masks from other filters on the same job
+        bits = np.unpackbits(bitmask.view(-1).numpy().view(np.uint8), bitorder = "little")
+        n = min(bits.shape[-1], self.generator.padded_vocab_size)
+        mask = torch.full((1, self.generator.padded_vocab_size), float("-inf"), dtype = torch.half)
+        mask[0, :n][torch.from_numpy(bits[:n]).bool()] = 0.0
+        return mask
 
 
     def __repr__(self):
@@ -369,24 +411,46 @@ class Job:
         logit_mask = None
         healing = self.prefix_token is not None and self.new_tokens == -1
 
-        # Finish filters and compile logit mask, but delay to avoid conflict with token healing
+        # Finish filters and compile logit mask, but delay to avoid conflict with token healing.
+        # Filter masks are either dense additive half tensors or packed int32 bitmasks (32
+        # tokens per word, bit clear = masked out). An all-bitmask set stays packed all the way
+        # to the sampling kernels; a bitmask is only expanded when it has to combine with a
+        # dense mask from another filter.
         if not healing:
             f_idx = 0
+            f_masks = []
             for f in self.filters:
                 if not f.is_active:
                     continue
                 if f.use_background_worker():
-                    f_mask = self.filter_futures[f_idx].result()
+                    f_masks.append(self.filter_futures[f_idx].result())
                 else:
-                    f_mask = self.logit_masks[f_idx]
-                if logit_mask is None:
-                    logit_mask = self.get_pinned_logit_mask()
-                    logit_mask.copy_(f_mask)
-                else:
-                    logit_mask += f_mask
+                    f_masks.append(self.logit_masks[f_idx])
                 f_idx += 1
             self.filter_futures.clear()
             self.logit_masks.clear()
+
+            all_bits = all(m.dtype == torch.int32 for m in f_masks)
+            if f_masks and all_bits:
+                logit_mask = self.get_pinned_logit_bitmask()
+                for i, m in enumerate(f_masks):
+                    w = min(m.shape[-1], logit_mask.shape[-1])
+                    if i == 0:
+                        logit_mask[:, :w].copy_(m[:, :w])
+                    else:
+                        logit_mask[:, :w] &= m[:, :w]
+                    # Tokens beyond a narrower mask count as masked out, matching the -inf
+                    # padding semantics of the dense path
+                    logit_mask[:, w:] = 0
+            else:
+                for m in f_masks:
+                    if m.dtype == torch.int32:
+                        m = self._expand_bitmask(m)
+                    if logit_mask is None:
+                        logit_mask = self.get_pinned_logit_mask()
+                        logit_mask.copy_(m)
+                    else:
+                        logit_mask += m
 
         # Add individually blocked tokens to mask
         blocked_tokens = []
@@ -398,7 +462,12 @@ class Job:
             if logit_mask is None:
                 logit_mask = self.get_pinned_logit_mask()
                 logit_mask.zero_()
-            logit_mask[:, blocked_tokens] = float("-inf")
+            if logit_mask.dtype == torch.int32:
+                bits = logit_mask.view(-1).numpy().view(np.uint32)
+                for t in blocked_tokens:
+                    bits[t >> 5] &= ~np.uint32(1 << (t & 31))
+            else:
+                logit_mask[:, blocked_tokens] = float("-inf")
 
         # Mask out all but allowed tokens (token healing)
         allowed_tokens = []
@@ -423,6 +492,71 @@ class Job:
             self.device_logit_mask = None
 
 
+    def constrain_output_now(self, output: str | torch.Tensor):
+        """
+        Inject a fixed token string into the job's output stream: the next samples are constrained to
+        the given tokens, one per generation step, after which sampling continues unconstrained. The
+        injected tokens pass through the regular generation pipeline, with these exceptions:
+
+        - All filters on the job are permanently disabled: their state machines cannot accept or track
+          arbitrary injected tokens, so they cannot be meaningfully resumed afterwards.
+        - Any held banned-string checkpoint is released (text held back by a partial match is emitted),
+          and banned-string matching is suspended until the last injected token has been processed.
+
+        Stop conditions, max_new_tokens and the loop detector still apply, so an injected token that is
+        a stop token, or injected text that completes a stop string, ends the job with the remaining
+        injected tokens dropped. It is up to the caller to pick a safe moment for the injection (e.g.
+        not during a tool call). Calling again while a previous injection is still draining appends to
+        the pending queue.
+
+        :param output:
+            Text to inject, tokenized with special tokens enabled, or a (1, S) tensor of token IDs.
+        """
+        assert self.generator is not None, \
+            "Job must be enqueued before constraining output"
+        if isinstance(output, torch.Tensor):
+            assert output.dim() == 2 and output.shape[0] == 1, \
+                "Forced token IDs must be a (1, S) tensor"
+            ids = output.to("cpu", torch.long)
+        else:
+            ids = self.generator.tokenizer.encode(
+                output,
+                encode_special_tokens = True,
+                add_bos = False,
+            )
+        assert ids.shape[-1] > 0, "Cannot constrain output to an empty token sequence"
+
+        self.filters_suspended = True
+        for f in self.filters:
+            f.is_active = False
+
+        # Accept any text held back by a partial banned-string match. Matching is suspended while
+        # forced tokens remain, so the checkpoint could never be rewound to anyway
+        self.checkpoint = None
+
+        if self.forced_ids is not None:
+            ids = torch.cat((self.forced_ids[:, self.forced_index:], ids), dim = -1)
+        self.forced_ids = ids
+        self.forced_index = 0
+        self.forced_ids_device = None
+
+
+    def _pop_forced_token(self, device) -> torch.Tensor:
+        """
+        Next pending forced token as a (1, 1) tensor on the sampling device.
+        """
+        if self.forced_ids_device is None:
+            self.forced_ids_device = self.forced_ids.to(device)
+        next_token = self.forced_ids_device[:, self.forced_index : self.forced_index + 1]
+        self.forced_index += 1
+        self.forced_sample = True
+        if self.forced_index >= self.forced_ids.shape[-1]:
+            self.forced_ids = None
+            self.forced_ids_device = None
+            self.forced_index = 0
+        return next_token
+
+
     def receive_logits(
         self,
         logits: torch.Tensor,
@@ -433,13 +567,18 @@ class Job:
         # assert self.is_prefill_done()
         # assert all(seq.live for seq in self.sequences)
 
-        next_token = self.sampler.forward(
-            logits,
-            self.current_pinned_ids,
-            self.rng.randint(0, (1<<32)-1),
-            self.generator.tokenizer,
-            logit_mask = self.device_logit_mask
-        )
+        # A pending forced token (constrain_output_now) replaces the sampler's choice; everything
+        # downstream treats it as a regular sample. Token healing (new_tokens == -1) resolves first
+        if self.forced_ids is not None and self.new_tokens >= 0:
+            next_token = self._pop_forced_token(logits.device)
+        else:
+            next_token = self.sampler.forward(
+                logits,
+                self.current_device_ids,
+                self.rng.randint(0, (1<<32)-1),
+                self.generator.tokenizer,
+                logit_mask = self.device_logit_mask
+            )
 
         next_prob, next_k_tokens, next_k_probs = None, None, None
 
@@ -480,20 +619,14 @@ class Job:
         """
         next_token = next_token.cpu()
         next_token_i = next_token.item()
+        forced_sample = self.forced_sample
+        self.forced_sample = False
 
         # Activate/advance filters if not healing
         filter_eos_condition = False
-        if self.new_tokens >= 0:
+        if self.new_tokens >= 0 and not self.filters_suspended:
             for f in self.filters:
-                if not f.is_active and next_token_i == f.trigger_token:
-                    f.is_active = True
-                    f.reset()
-                elif f.is_active:
-                    f.accept_token(next_token_i)
-                    if f.is_completed():
-                        f.is_active = False
-                        if f.eos_after_completed:
-                            filter_eos_condition = True
+                filter_eos_condition |= f.feed(next_token_i)
 
         # Accept token
         self.new_tokens += 1
@@ -565,6 +698,10 @@ class Job:
         ):
             nonlocal requeue_now
 
+            # A finished job never requeues (Generator would prefer requeue over EOS if both signals coincide)
+            if emit_eos:
+                requeue_now = False
+
             r = {
                 "job": self,
                 "stage": "streaming",
@@ -625,15 +762,19 @@ class Job:
 
             if emit_eos:
                 self.is_finished = True
+                cached = self.rq_cached if self.rq_cached is not None else (
+                    self.cached_pages // len(self.sequences),
+                    (self.cached_pages * PAGE_SIZE + self.cached_tokens) // len(self.sequences),
+                )
                 r.update({
                     "full_completion": self.full_completion,
                     "new_tokens": self.rq_new_tokens + self.new_tokens,
-                    "prompt_tokens": len(self.sequences[0].input_ids),
+                    "prompt_tokens": self.rq_prompt_tokens or len(self.sequences[0].input_ids),
                     "time_enqueued": self.time_enqueued,
                     "time_prefill": self.time_prefill,
                     "time_generate": self.time_generate,
-                    "cached_pages": self.cached_pages // len(self.sequences),
-                    "cached_tokens": (self.cached_pages * PAGE_SIZE + self.cached_tokens) // len(self.sequences),
+                    "cached_pages": cached[0],
+                    "cached_tokens": cached[1],
                 })
                 if self.generator.draft_model or self.generator.ngram_match_min:
                     r.update({
@@ -671,6 +812,7 @@ class Job:
             unhealed = id_to_piece[self.prefix_token[0].item()]
             new_text = new_text[len(unhealed):]
 
+        held_text_before = self.held_text
         self.held_text += new_text
         self.held_tokens.append(next_token)
         if self.return_probs:
@@ -687,26 +829,28 @@ class Job:
         if token in self.stop_tokens:
             return emit(results, emit_eos = True, eos_reason = "stop_token", stop_token = token)
 
-        # Stop if we reach max_new_tokens
-        if self.new_tokens >= self.max_new_tokens - self.generator.num_draft_tokens:
+        # Stop if we reach max_new_tokens. Exact: a limit reached inside a speculative window is fine, the
+        # generator rejects the window's remaining draft positions when a job ends mid-window (eos path)
+        if self.new_tokens >= self.max_new_tokens:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "max_new_tokens")
 
         # End on filter completed
         if filter_eos_condition:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "end_filter")
 
-        # Hold text if it contains an incomplete character
-        if self.held_text.endswith("�") and self.held_text.count("�") < 5:
+        # Hold text if it ends in an incomplete character
+        if self.held_text.endswith("�"):
             test_decode = self.generator.tokenizer.decode(
                 self.held_tokens.torch(),
                 decode_special_tokens = self.decode_special_tokens
             )[0]
-            if not "�" in test_decode:
-                self.held_text = test_decode
-            else:
-                # Don't hold forever if a broken generation yields a replacement character but never completes
-                # the Unicode symbol
-                return emit(results, emit_held = (len(test_decode) > self.stop_string_max_length + 20))
+            if test_decode.endswith("�") and len(test_decode) <= self.stop_string_max_length + 20:
+                # The trailing character may still be completed by upcoming tokens; keep holding, but not
+                # forever, in case a broken generation never completes the character
+                return emit(results)
+            # Tail is complete: adopt the full decode as the held text. Any remaining replacement characters
+            # are interior, representing invalid bytes that no later token can repair
+            self.held_text = test_decode
 
         # Hold text as long as it contains part of a banned string
         def unset_checkpoint():
@@ -716,7 +860,7 @@ class Job:
             if self.checkpoint is None:
                 self.checkpoint = {
                     "offset": 1,
-                    "held_text": self.held_text[:-len(new_text)],
+                    "held_text": held_text_before,   # not held_text[:-len(new_text)]: new_text may be empty
                     "held_tokens": self.held_tokens.clone(1),
                     "held_probs": self.held_probs.clone(1),
                     "held_k_tokens": self.held_k_tokens.clone(1),
@@ -736,6 +880,11 @@ class Job:
             assert self.checkpoint is not None
             offset = self.checkpoint["offset"]
             self.new_tokens -= offset
+
+            # Roll back filter state over the rewound tokens (every token counted in the offset was
+            # fed to the filters when it was sampled)
+            for f in self.filters:
+                f.rewind(offset)
 
             # The attention cache rewinds by truncation, but recurrent states advance destructively. SWA states
             # can roll back in place within their stored window; other states are restored from the most recent
@@ -765,6 +914,7 @@ class Job:
                 p_page = seq.kv_position // PAGE_SIZE
                 seq.kv_position -= offset
                 seq.sequence_ids.truncate(len(seq.sequence_ids) - offset)
+                self.pinned_ids_valid = min(self.pinned_ids_valid, len(seq.sequence_ids))
                 n_page = seq.kv_position // PAGE_SIZE
                 for pi in range(n_page, len(seq.allocated_pages)):
                     page = seq.allocated_pages[pi]
@@ -805,7 +955,14 @@ class Job:
         if requeue_now:
             unset_checkpoint()
 
-        elif self.banned_strings_utf32_offsets is not None and self.new_tokens > 0:
+        # Banned-string matching is suspended for forced tokens (and while more remain queued), so a
+        # rewind can never truncate an injection
+        elif (
+            self.banned_strings_utf32_offsets is not None
+            and self.new_tokens > 0
+            and not forced_sample
+            and self.forced_ids is None
+        ):
             match = ext.partial_strings_match(
                 np.frombuffer(self.held_text.lower().encode("utf-32-le"), dtype = np.uint8),
                 self.banned_strings_utf32_offsets,
@@ -890,9 +1047,15 @@ class Job:
             "time_enqueued": self.time_enqueued,
             "time_prefill": self.time_prefill,
             "time_generate": self.time_generate,
-            "rq_new_tokens": self.new_tokens - 1,
+            "rq_new_tokens": self.new_tokens,   # every token accepted so far counts; the requeued segment starts after them
+            "accepted_draft_tokens": self.accepted_draft_tokens,
+            "rejected_draft_tokens": self.rejected_draft_tokens,
+            "prompt_tokens": self.rq_prompt_tokens or len(seq.input_ids),
+            "cached": self.rq_cached if self.rq_cached is not None else (
+                self.cached_pages, self.cached_pages * PAGE_SIZE + self.cached_tokens),
             "sam": self.sam,
-            "draft_ema": self.draft_ema,
+            "forced_ids": None if self.forced_ids is None else self.forced_ids[:, self.forced_index:],
+            "filters_suspended": self.filters_suspended,
         }
 
         serial_number = self.serial_number
@@ -938,6 +1101,12 @@ class Job:
         self.pagetable = generator.pagetable
         self.skips = 0
 
+        # No explicit limit: whatever the cache can still hold beyond the prompt, less the default
+        # requeue budget's headroom below so that budget still fits the cache exactly
+        if self.max_new_tokens is None:
+            self.max_new_tokens = max(1, self.generator.max_total_tokens - len(self.sequences[0].input_ids)
+                                      - 1 - self.generator.num_draft_tokens)
+
         # Align max_rq_tokens to page boundary or recurrent checkpoint
         if self.max_rq_tokens is not None:
             if len(self.sequences) == 1:
@@ -947,7 +1116,8 @@ class Job:
                 y = (x - 1 + self.max_rq_tokens + boundary - 1) // boundary * boundary
                 self.max_rq_tokens = y - x
         else:
-            self.max_rq_tokens = self.max_new_tokens + 1
+            # Default budget: the whole response plus one speculative window past the limit
+            self.max_rq_tokens = self.max_new_tokens + 1 + self.generator.num_draft_tokens
 
         # Compatibility checks
         if self.banned_strings and self.generator.recurrent_cache is not None:
@@ -1149,10 +1319,13 @@ class Job:
                 # chunk redundantly but won't write out-of-bounds since cache pages are already allocated for the
                 # whole input sequence including MM tokens. (This is for Gemma4 specifically, which has image token
                 # spans of at most 280 tokens.)
+                # The mask covers only the prompt: a rewind replay chunk past it (generated tokens
+                # are never multimodal) must not index beyond the mask
                 if atomic_mm_prefill:
                     ext_prefill_end = prefill_end
                     while (
                         ext_prefill_end < len(seq.sequence_ids) - 1 and
+                        ext_prefill_end < len(seq.multimodal_mask) and
                         seq.multimodal_mask[ext_prefill_end - 1] and
                         seq.multimodal_mask[ext_prefill_end]
                     ):
@@ -1164,11 +1337,21 @@ class Job:
                 # span extends before the chunk, so non-causal attention windows cover the whole
                 # span rather than just the in-chunk suffix
                 mm_span_prefix = 0
-                if self.embeddings:
+                # The mask covers only the prompt; generated tokens are never multimodal
+                if self.embeddings and prefill_start <= len(seq.multimodal_mask):
                     pp = prefill_start
                     while pp > 0 and seq.multimodal_mask[pp - 1]:
                         mm_span_prefix += 1
                         pp -= 1
+
+                # Rewind prefill can exceed the prompt-length table, which the RoPE kernel reads unchecked
+                if self.alt_rope_freqs is not None and prefill_end > self.alt_rope_freqs.shape[-2]:
+                    ids = seq.sequence_ids.torch()
+                    # Appending text advances the next position and sequence length equally,
+                    # leaving alt_rope_offset unchanged for decode
+                    self.alt_rope_freqs, _ = self.generator.model.g_rope.get_mrope_freqs(
+                        ids, self.embeddings, ids.shape[-1]
+                    )
 
                 params = {
                     "attn_mode": "flash_attn",
@@ -1277,11 +1460,22 @@ class Job:
         recurrent models this also creates or restores the recurrent state corresponding to the cached prefix.
         """
 
+        # Pages matching any of the job's own prompt hashes must not be taken to serve this same allocation's
+        # cache misses (e.g. when resuming a partially evicted sequence, the misses at the front must not
+        # cannibalize the surviving pages further along the chain)
+        protected_hashes = set(self.all_unique_hashes)
+
         for seq in self.sequences:
             allocated_pages, cached_pages, non_sequential_pages, stashed_recurrent_state = \
-                seq.allocate_pages(self.pagetable, self.generator.recurrent_cache)
+                seq.allocate_pages(self.pagetable, self.generator.recurrent_cache, protected_hashes)
 
-            self.recurrent_state = None
+            # Free the previous state before acquiring a new one. A bare assignment drops
+            # the handle without returning the slot index to the cache free list, so every
+            # reallocation (multi-sequence jobs, resumption after eviction) permanently
+            # burns a slot; with num_slots == max_batch_size (default 4 on recurrent
+            # models) a few such jobs exhaust the pool. The rewind path already does this
+            # correctly via free_recurrent_state().
+            self.free_recurrent_state()
             if self.generator.recurrent_cache is not None:
                 if stashed_recurrent_state is None:
                     self.recurrent_state = self.generator.cache.get_new_state()
@@ -1309,11 +1503,20 @@ class Job:
     def prepare_sampling_past_ids(self):
         if not self.sampler.reqs_past_ids:
             return
+        n = len(self.sequences[0].sequence_ids)
         if self.pinned_ids is None:
             max_ids = max(len(seq.sequence_ids) for seq in self.sequences) + self.max_new_tokens + 8
             self.pinned_ids = torch.empty((1, max_ids), dtype = torch.long, pin_memory = True)
-        self.current_pinned_ids = self.pinned_ids[:, :len(self.sequences[0].sequence_ids)]
-        self.current_pinned_ids.copy_(self.sequences[0].sequence_ids.torch())
+            self.pinned_ids_valid = 0
+        # The sequence only grows by appending or shrinks by truncation (which clamps the
+        # watermark), so the buffer is valid below the watermark and only the tail is staged
+        if self.pinned_ids_valid < n:
+            self.pinned_ids[:, self.pinned_ids_valid : n].copy_(
+                self.sequences[0].sequence_ids.torch_slice(self.pinned_ids_valid, n)
+            )
+            self.pinned_ids_valid = n
+        self.current_pinned_ids = self.pinned_ids[:, :n]
+        self.current_device_ids = self.current_pinned_ids.to(self.logits_device, non_blocking = True)
 
 
     def activate(self):
@@ -1325,7 +1528,7 @@ class Job:
             for f in self.filters:
                 f.attach(self)
                 f.reset()
-                f.is_active = f.trigger_token is None
+                f.is_active = f.trigger_token is None and not self.filters_suspended
 
 
     def is_checkpoint_boundary(self, override_interval = None):
@@ -1390,40 +1593,6 @@ class Job:
         if self.recurrent_state is not None:
             self.recurrent_state.free()
             self.recurrent_state = None
-
-
-    def draft_target(self, max_tokens: int, skip_ema: float = 0.0, probe_interval: int = 16) -> int:
-        """
-        Number of draft tokens this job wants for the next verification window, based on recent acceptance.
-        Optimistic before any window has been measured. With a skip threshold, an EMA below it requests no
-        drafting at all (0), except for a small probe window every probe_interval rounds — skipped rounds
-        produce no acceptance signal, so the probe is the only way the average can recover.
-        """
-        if self.draft_ema is None:
-            return max_tokens
-        if skip_ema > 0.0 and self.draft_ema < skip_ema:
-            self.draft_skip_count += 1
-            if self.draft_skip_count < probe_interval:
-                return 0
-            self.draft_skip_count = 0
-            return min(2, max_tokens)
-        self.draft_skip_count = 0
-        return max(1, min(max_tokens, math.ceil(self.draft_ema)))
-
-
-    def update_draft_ema(self, accepted: int, window: int, alpha_up: float, alpha_down: float):
-        """
-        Update the moving average of accepted draft tokens. Acceptance is censored by the window size, so a fully
-        accepted window counts as one more than observed, letting the window grow again while the output stays
-        predictable. Asymmetric weights let the window climb into a predictable stretch faster than it decays on
-        isolated rejections.
-        """
-        a = accepted + 1 if accepted >= window else accepted
-        if self.draft_ema is None:
-            self.draft_ema = float(a)
-        else:
-            alpha = alpha_up if a > self.draft_ema else alpha_down
-            self.draft_ema = alpha * a + (1.0 - alpha) * self.draft_ema
 
 
     def get_ngram_draft(self, draft_length: int):

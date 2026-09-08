@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import math
+import os
 from ....ext import exllamav3_ext as ext
 from ....util.progress import ProgressBar
 from ....util.memory import free_mem, list_gpu_tensors
@@ -49,10 +50,18 @@ def tensor_core_perm_i(device):
 
 
 @lru_cache
-def get_temp_buffers(device, K: int):
+def get_temp_buffers(device, K: int, tile_len: int = 256):
+    # The kernel runs one block per tile and caps each wave at min(temp_costs.size(0), 2 * SMs). At K >= 4 the
+    # temp buffers are cheap enough to size for full occupancy on large GPUs (+17% throughput on GB202 at big
+    # batches); at lower K, temp_edges is multiple GB already and 256 stays the cap
     max_batch_size = 256
+    if K >= 4:
+        mp_count = torch.cuda.get_device_properties(device).multi_processor_count
+        # The kernel may run up to 1024 / threads blocks per SM (see quantize_tiles_kernel.cuh)
+        blocks_per_sm = {7: 4, 8: 8}.get(K, 2)
+        max_batch_size = max(256, blocks_per_sm * mp_count)
     temp_costs = torch.zeros((max_batch_size, 2, 65536 >> K), dtype = torch.half, device = device)
-    temp_edges = torch.zeros((max_batch_size, 256, 65536 >> K), dtype = torch.short, device = device)
+    temp_edges = torch.zeros((max_batch_size, tile_len, 65536 >> K), dtype = torch.short, device = device)
     return temp_costs, temp_edges
 
 
@@ -61,10 +70,11 @@ def quantize_tiles(tiles, quant_args: dict):
     Quantize a batch of 16x16 tiles on the current device.
 
     tiles is shaped (num_tiles, 256) in the kernel's expected element order. The CUDA extension returns both the
-    reconstructed float tile values and the short encoded indices used later for packing.
+    reconstructed float tile values and the short encoded indices used later for packing. Length-160 rows
+    (n-gram embedding vectors, mul1 codebook only) are accepted too and quantized as single tail-biting rings.
     """
     tiles = tiles.contiguous()
-    assert tiles.shape[1] == 256
+    assert tiles.shape[1] in (256, 160)
     assert tiles.dtype == torch.float
 
     K = quant_args["K"]
@@ -72,7 +82,11 @@ def quantize_tiles(tiles, quant_args: dict):
     mul1 = "mul1" in quant_args
     quantized_tiles = torch.zeros_like(tiles)
     quantized_idx = torch.zeros_like(tiles, dtype = torch.short)
-    temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
+    # NB: same call signature as other sites for tile_len 256, so the lru_cache key stays shared
+    if tiles.shape[1] == 256:
+        temp_costs, temp_edges = get_temp_buffers(tiles.device, K)
+    else:
+        temp_costs, temp_edges = get_temp_buffers(tiles.device, K, tiles.shape[1])
     ext.quantize_tiles(
         tiles,
         quantized_tiles,
@@ -89,6 +103,63 @@ def quantize_tiles(tiles, quant_args: dict):
 @lru_cache
 def get_quant_stream(device):
     return torch.cuda.Stream(device = device)
+
+
+@lru_cache
+def arch_prior_speed(device: int) -> float:
+    """Initial relative quant-throughput guess by architecture, used to seed device splits
+    before any measurements exist. From measured conversion throughput: Ampere lands at about
+    half of Ada, which is about 80% of Blackwell (Hopper assumed equal to Blackwell); anything
+    older is pessimistically assumed half of Ampere."""
+    major, minor = torch.cuda.get_device_capability(device)
+    if major >= 9: return 5.0                        # Hopper, Blackwell
+    if major == 8: return 4.0 if minor == 9 else 2.0  # Ada / Ampere
+    return 1.0
+
+
+class AutoSplit:
+    """Learned per-device speed ratios for heterogeneous multi-GPU conversion splits. Each
+    workload kind (parallel-quant threads, calibration row workers, tile fan-out slices) is
+    tracked separately, since their per-unit costs differ; within a kind, only the ratios
+    between devices matter. Speeds are EMA-damped so one noisy module (JIT warmup, thermal
+    excursions) doesn't swing the split. Until every active device has a measurement for the
+    kind, the split falls back to the per-architecture prior."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.speeds = {}   # kind -> {device: ema work/sec}
+
+    def report(self, kind: str, device: int, work: float, elapsed_s: float):
+        if work <= 0 or elapsed_s < 0.05:
+            return
+        s = work / elapsed_s
+        with self.lock:
+            d = self.speeds.setdefault(kind, {})
+            prev = d.get(device)
+            d[device] = s if prev is None else 0.7 * prev + 0.3 * s
+
+    def ratios(self, kind: str, devices: list) -> list:
+        with self.lock:
+            d = self.speeds.get(kind)
+            if d is not None and all(dev in d for dev in devices):
+                return [d[dev] for dev in devices]
+        # Incomplete measurements: architecture priors (mixing measured speeds with unit-less
+        # priors would skew the split, so it is one or the other)
+        return [arch_prior_speed(dev) for dev in devices]
+
+    def has_measured(self, kind: str, devices: list) -> bool:
+        with self.lock:
+            d = self.speeds.get(kind)
+            return d is not None and all(dev in d for dev in devices)
+
+auto_split = AutoSplit()
+
+# Pending timing events from the last measured quantize_tiles_multigpu call, and per-device
+# accumulators: single calls are ~ms-scale, so busy time is aggregated over many calls and
+# reported to the auto split once enough has been observed
+_tiles_calls = 0
+_tiles_timing = None
+_tiles_acc = {}   # device -> [tiles, seconds]
 
 
 pinned_tiles: torch.Tensor | None = None
@@ -143,6 +214,30 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
             split_sizes[i] += split_sizes[i + 1]
             split_sizes[i + 1] = 0
 
+    # Harvest the previous measured call's per-device busy times (the events have long
+    # completed by the next call) into the accumulators, and report once every device has
+    # enough observed time for a meaningful speed. Per-device event pairs, since elapsed_time
+    # cannot cross devices; a new measured call is fenced periodically
+    global _tiles_calls, _tiles_timing
+    if _tiles_timing is not None:
+        p_devs, p_sizes, p_starts, p_ends = _tiles_timing
+        if all(e.query() for e in p_ends):
+            for dv, sz, e0, e1 in zip(p_devs, p_sizes, p_starts, p_ends):
+                acc = _tiles_acc.setdefault(dv, [0, 0.0])
+                acc[0] += sz
+                acc[1] += e0.elapsed_time(e1) / 1000
+            _tiles_timing = None
+            if all(_tiles_acc.get(dv, (0, 0.0))[1] > 0.25 for dv in devices):
+                for dv in devices:
+                    acc = _tiles_acc.pop(dv)
+                    auto_split.report("quant_tiles", dv, acc[0], acc[1])
+    _tiles_calls += 1
+    measure = (
+        _tiles_timing is None and _tiles_calls % 4 == 0 and
+        all(s > 0 for s in split_sizes) and tiles.shape[0] >= 256
+    )
+    m_starts = []
+
     pin_split_tiles = torch.split(pin_tiles, split_sizes)
     pin_split_q_tiles = torch.split(pin_q_tiles, split_sizes)
     pin_split_q_idx = torch.split(pin_q_idx, split_sizes)
@@ -156,6 +251,11 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
             # Wait for input in host memory
             if i > 0:
                 stream.wait_event(copy_input_event)
+
+            if measure:
+                e0 = torch.cuda.Event(enable_timing = True)
+                e0.record(stream)
+                m_starts.append(e0)
 
             if split_sizes[i] > 0:
 
@@ -188,9 +288,12 @@ def quantize_tiles_multigpu(tiles, quant_args: dict):
                 pin_split_q_idx[i].copy_(dev_q_idx, non_blocking = True)
 
             # Finished slice
-            evt = torch.cuda.Event(blocking = False)
+            evt = torch.cuda.Event(blocking = False, enable_timing = measure)
             slice_done_events.append(evt)
             evt.record(stream)
+
+    if measure:
+        _tiles_timing = (list(devices), list(split_sizes), m_starts, slice_done_events)
 
     # Copy pinned buffers to original device
     with torch.cuda.stream(main_stream):
@@ -289,7 +392,30 @@ def blockwise_preapply_had_r_(x: torch.Tensor, had_dim):
         x[:, start:end] = block_transformed
 
 
-def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool):
+def save_failed_cholesky(H: torch.Tensor, quant_args: dict, debug_info: dict | None):
+    """Dump a Hessian that failed to decompose, before any retry damping is added, so the
+    failure can be studied offline. H arrives sign-flipped and Hadamard-transformed with the
+    base sigma_reg damping applied; su (in the dump) and the block Hadamard are orthogonal, so
+    the captured matrix is exactly recoverable by applying the inverse transforms."""
+    debug_dir = quant_args.get("debug_dir")
+    if not debug_dir:
+        return
+    try:
+        os.makedirs(debug_dir, exist_ok = True)
+        key = (debug_info or {}).get("key") or "unknown"
+        path = os.path.join(debug_dir, f"cholesky_fail_{key}.pt")
+        torch.save({
+            "H": H.detach().cpu().clone(),
+            "sigma_reg": quant_args.get("sigma_reg", 0.025),
+            **{k: (v.detach().cpu().clone() if isinstance(v, torch.Tensor) else v)
+               for k, v in (debug_info or {}).items()},
+        }, path)
+        print(f" !! Saved failing Hessian to {path}")
+    except Exception as e:
+        print(f" !! Failed to save Hessian debug dump: {e}")
+
+
+def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool, debug_info: dict | None = None):
 
     n, _ = H.shape
     assert (n % b == 0)
@@ -312,6 +438,10 @@ def block_ldl(H: torch.Tensor, b: int, quant_args: dict, verbose: bool):
 
         except torch._C._LinAlgError as e:
             num_cholesky_retries += 1
+            if num_cholesky_retries == 1:
+                # Capture the matrix as it first failed (retry damping has never actually
+                # recovered a failing decomposition, so the initial state is the interesting one)
+                save_failed_cholesky(H, quant_args, debug_info)
             if num_cholesky_retries > 10:
                 print(" ## Cholesky decomp. failed, number of retries exceeded")
                 raise e
@@ -599,6 +729,111 @@ def fallback_quant(
     return weight_q, encoded, mse
 
 
+def block_trace(A, B, block_size = 1024):
+    """
+    Compute trace(A.T @ B @ A) in column blocks of B to bound the temporary
+    """
+    total = 0.0
+    for j_start in range(0, B.shape[1], block_size):
+        j_end = min(j_start + block_size, B.shape[1])
+        B_block = B[:, j_start:j_end]
+        A_j_block = A[j_start:j_end, :]
+        partial = torch.einsum("ik,ij,jk->", A, B_block, A_j_block)
+        total += partial.item()
+    return total
+
+
+def ldlq_batched(
+    weights: torch.Tensor,
+    Ls: torch.Tensor,
+    quant_args: dict,
+    pb: ProgressBar | None = None
+):
+    """
+    LDLQ over a stack of same-shape tensors with per-tensor L, batched so each 16-row step quantizes all
+    tensors' tiles in one quantize_tiles call. The recursion is identical to ldlq() per batch element; only
+    the matmuls become bmm. All buffers stay on-device (this path is only used for groups of small tensors).
+
+    :param weights:
+        Input weights, shape (B, k, n), float, on the quant device
+
+    :param Ls:
+        LDL decompositions of the regularized Hessians, shape (B, k, k), same device
+
+    :return:
+        tuple:
+         - quantized weights, shape (B, k, n)
+         - indices (unpacked), shape (B, k // 16, n // 16, 256), int16
+    """
+    devices = quant_args["devices"]
+    for device in devices:
+        torch.cuda.synchronize(device)
+    main_stream = get_quant_stream(devices[0])
+    with torch.cuda.stream(main_stream):
+
+        device = weights.device
+        assert device == torch.device(devices[0]) and Ls.device == device
+        B, size_k, size_n = weights.shape
+        assert Ls.shape == (B, size_k, size_k)
+        assert size_k % 16 == 0
+        assert size_n % 128 == 0
+        tiles_k = size_k // 16
+        tiles_n = size_n // 16
+
+        buf_size_k = max(quant_args.get("buf_size_k", 128), 16)
+        assert buf_size_k % 16 == 0
+        assert size_k % buf_size_k == 0
+
+        p_row = 0
+        perm = tensor_core_perm(device)
+        perm_i = tensor_core_perm_i(device)
+
+        prod_cache = torch.zeros((B, size_k, size_n), dtype = torch.float, device = device)
+        weight_q = torch.zeros_like(weights)
+        encoded = torch.zeros((B, tiles_k, tiles_n, 256), dtype = torch.short, device = device)
+
+        for j in range(size_k, 0, -buf_size_k):
+            i = j - buf_size_k
+
+            for bj in range(buf_size_k, 0, -16):
+                bi = bj - 16
+                gi, gj = i + bi, i + bj
+
+                # Error so far for the remaining rows of the current span
+                bb_err = weights[:, gj:j] - weight_q[:, gj:j]
+
+                # Corresponding slice of the LDL decompositions
+                bb_L = Ls[:, gj:j, gi:gj]
+
+                # Input tiles for quantization; out-of-place equivalent of ldlq()'s in-place accumulation
+                # (the mutated prod_cache rows are never read again there)
+                compensation = torch.baddbmm(prod_cache[:, gi:gj], bb_L.transpose(1, 2), bb_err)
+                rows = weights[:, gi:gj] + compensation
+
+                tiles = rows.reshape(B, 16, tiles_n, 16).permute(0, 2, 1, 3).reshape(B * tiles_n, 256)
+                tiles = tiles[:, perm]
+
+                quant_w, quant_i = quantize_tiles_multigpu(tiles, quant_args)
+
+                quant_w = quant_w[:, perm_i]
+                quant_w = quant_w.reshape(B, tiles_n, 16, 16).permute(0, 2, 1, 3).reshape(B, 16, size_n)
+                weight_q[:, gi:gj] = quant_w
+                encoded[:, gi // 16] = quant_i.view(B, tiles_n, 256)
+
+                if pb:
+                    p_row += 1
+                    pb.update(p_row)
+
+            # Cache error term for the rest of the matrices
+            b_err = weights[:, i:j] - weight_q[:, i:j]
+            prod_cache.baddbmm_(Ls[:, i:j].transpose(1, 2), b_err)
+
+        for device in devices:
+            torch.cuda.synchronize(device)
+
+    return weight_q, encoded
+
+
 finalize_capture_H_mutex = threading.Lock()
 
 def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
@@ -634,8 +869,19 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
             diag_mean = 0.0
         else:
             H /= count
-            diag_mean = torch.diag(H).mean()
-            q_fallback = diag_mean.item() < 1e-20
+            diag_mean = torch.diag(H).mean().item()
+            # A non-finite Hessian (e.g. fp16 activation overflow reaching the capture) cannot
+            # be repaired by damping, and NaN would also defeat the < comparison below and turn
+            # the whole diagonal non-finite through the regularization term
+            if not math.isfinite(diag_mean):
+                inf_nan = H_data.get("inf_nan")
+                counts = f" (captured {inf_nan[0].item():,} inf, {inf_nan[1].item():,} NaN activation values)" \
+                    if inf_nan is not None else ""
+                print(f" !! Non-finite Hessian for {H_data.get('first_key')}, using uncalibrated fallback{counts}")
+                q_fallback = True
+                diag_mean = 0.0
+            else:
+                q_fallback = diag_mean < 1e-20
 
         # Regularize diagonal
         H.diagonal().add_(quant_args.get("sigma_reg", 0.025) * diag_mean)
@@ -663,7 +909,13 @@ def finalize_capture_H(H_data: dict, quant_args: dict, verbose: bool):
         if q_fallback:
             L = None
         else:
-            L, H = block_ldl(H, 16, quant_args, verbose)
+            L, H = block_ldl(H, 16, quant_args, verbose, debug_info = {
+                "key": H_data.get("first_key"),
+                "count": H_data.get("count"),
+                "num_total": H_data.get("num_total"),
+                "inf_nan": H_data.get("inf_nan"),
+                "su": su,
+            })
             dr = torch.arange(k)
             L[dr, dr] = 0
 
@@ -701,6 +953,102 @@ def pack_signs(signs: torch.Tensor, quant_args: dict) -> torch.Tensor:
     return packed
 
 
+def sample_scale_tiles(weight_r: torch.Tensor, width: int = 3) -> torch.Tensor:
+    """
+    Sample tiles for the global scale search: a wrapped diagonal, guaranteeing every tile row and column is
+    sampled at least once (outliers are typically whole input or output channels), plus the tiles with the
+    highest and lowest RMS as explicit outlier insurance for anything a diagonal of the given width misses.
+    """
+    device = weight_r.device
+    tiles_k = weight_r.shape[0] // 16
+    tiles_n = weight_r.shape[1] // 16
+    w4 = weight_r.view(tiles_k, 16, tiles_n, 16)
+
+    diag_len = max(tiles_k, tiles_n)
+    ii = torch.arange(diag_len, device = device).repeat_interleave(width)
+    ww = torch.arange(width, device = device).repeat(diag_len)
+    kk = ii % tiles_k
+    nn = (ii + ww) % tiles_n
+
+    # Tiles with extreme RMS, by flat tile index
+    num_x = max(8, (diag_len * width) // 16)
+    tile_ms = w4.square().mean(dim = (1, 3)).flatten()
+    num_x = min(num_x, (tile_ms.shape[0] + 1) // 2)
+    hi = torch.topk(tile_ms, num_x).indices
+    lo = torch.topk(tile_ms, num_x, largest = False).indices
+    xk = torch.cat((hi, lo)) // tiles_n
+    xn = torch.cat((hi, lo)) % tiles_n
+
+    tiles = w4[torch.cat((kk, xk)), :, torch.cat((nn, xn)), :].reshape(-1, 256)
+    return tiles[:, tensor_core_perm(device)].contiguous()
+
+
+def g_scale_search_batch(
+    samples: list[torch.Tensor],
+    quant_args: dict,
+) -> list[tuple[float, torch.Tensor]]:
+    """
+    Global scale search over a group of tensors' tile samples, batching all evaluations into as few
+    quantize_tiles calls as possible (two host syncs per group, regardless of group size).
+
+    The sampled error curve is flat near the optimum but not perfectly unimodal, so a sequential golden-section
+    search can converge on a local wiggle well away from the true minimum. Instead: a coarse grid over the full
+    range on a subsample of the tiles, then a fine grid around the coarse minimum on the full sample, refined by
+    parabolic interpolation; the curve's flatness makes the grid spacing precise enough.
+    """
+    n_t = len(samples)
+    device = samples[0].device
+    max_tiles = 65536
+
+    def eval_pairs(pairs, tile_sets):
+        # pairs: list of (tensor_idx, scale); one mse per pair, kernel calls chunked to the batch limit
+        out = torch.empty(len(pairs), dtype = torch.float, device = device)
+        i = 0
+        while i < len(pairs):
+            j, tot = i, 0
+            while j < len(pairs) and tot + tile_sets[pairs[j][0]].shape[0] <= max_tiles:
+                tot += tile_sets[pairs[j][0]].shape[0]
+                j += 1
+            j = max(j, i + 1)
+            batch = torch.cat([tile_sets[t] * s for t, s in pairs[i:j]])
+            quant_w, _ = quantize_tiles_multigpu(batch, quant_args)
+            offset = 0
+            for p, (t, s) in enumerate(pairs[i:j]):
+                cnt = tile_sets[t].shape[0]
+                out[i + p] = (quant_w[offset : offset + cnt] / s - tile_sets[t]).square().mean()
+                offset += cnt
+            i = j
+        return out
+
+    # Stage 1: coarse grid over the full search range, on a subsample of each tensor's tiles
+    coarse = [0.1 + 0.2 * i for i in range(10)]  # 0.1 .. 1.9, same range as the old golden-section bracket
+    subs = [s[::3] for s in samples]
+    pairs1 = [(t, s) for t in range(n_t) for s in coarse]
+    mse1 = eval_pairs(pairs1, subs).view(n_t, len(coarse))
+    centers = [coarse[c] for c in mse1.argmin(dim = 1).tolist()]
+
+    # Stage 2: fine grid around each tensor's coarse minimum, on its full sample
+    step = 0.075
+    fine = [[c + step * (i - 2) for i in range(5)] for c in centers]
+    pairs2 = [(t, s) for t in range(n_t) for s in fine[t]]
+    mse2 = eval_pairs(pairs2, samples).view(n_t, 5)
+    mse2_h = mse2.tolist()
+
+    results = []
+    for t in range(n_t):
+        best = min(range(5), key = lambda i: mse2_h[t][i])
+        if 0 < best < 4:
+            y0, y1, y2 = mse2_h[t][best - 1], mse2_h[t][best], mse2_h[t][best + 1]
+            denom = y0 - 2.0 * y1 + y2
+            offset = 0.5 * (y0 - y2) / denom if denom > 0 else 0.0
+            offset = max(-0.5, min(0.5, offset))
+        else:
+            offset = 0.0
+        best_scale = max(fine[t][best] + offset * step, 0.01)
+        results.append((best_scale, mse2[t, best]))
+    return results
+
+
 def g_scale_gss(
     weight_r: torch.Tensor,
     verbose: bool,
@@ -708,24 +1056,6 @@ def g_scale_gss(
     width: int = 3,
     pb: ProgressBar = None
 ):
-    """
-    Select a sample of tiles along a wrapped diagonal (sampling from every row and column of tiles, hopefully
-    representative) and search for the global scale within given range that minimizes the direct quantization
-    error
-    """
-    tiles = []
-    tiles_k = weight_r.shape[0] // 16
-    tiles_n = weight_r.shape[1] // 16
-    for i in range(max(tiles_k, tiles_n)):
-        for w in range(width):
-            k = (i % tiles_k) * 16
-            n = ((i + w) % tiles_n) * 16
-            tile = weight_r[k : k + 16, n : n + 16].clone()
-            tile = tile.view(256)
-            tile = tile[tensor_core_perm(weight_r.device)]
-            tiles.append(tile)
-    tiles = torch.stack(tiles)
-
     devices = quant_args["devices"]
     for device in devices:
         torch.cuda.synchronize(device)
@@ -733,52 +1063,19 @@ def g_scale_gss(
     main_stream = get_quant_stream(devices[0])
     # TODO: Figure out why Torch always initializes cuda:0 when exiting this CM, even when it's not used
     with torch.cuda.stream(main_stream):
-
-        def test_scale(scale: float):
-            quant_w, quant_i = quantize_tiles_multigpu(tiles * scale, quant_args)
-            mse = ((quant_w / scale - tiles) ** 2).mean()
-            return mse
-
-        # Assume quantization error is a unimodal function of scale, golden section search to find minimum
-        phi = (1 + math.sqrt(5)) / 2
-        resphi = 2 - phi
-
-        a, b = 0.1, 1.9
-        tol = 0.01
-        delta1 = abs(b - a)
-
-        x1 = a + resphi * (b - a)
-        x2 = b - resphi * (b - a)
-        f1 = test_scale(x1)
-        f2 = test_scale(x2)
-        while abs(b - a) > tol:
-            # if verbose:
-                # print(f"     - gss: a = {a:.6f}, b = {b:.6f}")
-            if f1 < f2:
-                b = x2
-                x2 = x1
-                f2 = f1
-                x1 = a + resphi * (b - a)
-                f1 = test_scale(x1)
-            else:
-                a = x1
-                x1 = x2
-                f1 = f2
-                x2 = b - resphi * (b - a)
-                f2 = test_scale(x2)
-            delta2 = abs(b - a)
-            if pb:
-                pb.update(100 - 100 * int(delta2 / delta1))
-
-        best_scale = (a + b) / 2
+        tiles = sample_scale_tiles(weight_r, width)
+        if pb:
+            pb.update(50)
+        best_scale, best_mse = g_scale_search_batch([tiles], quant_args)[0]
+        if pb:
+            pb.update(100)
         if verbose:
-            print(f"     - gss: min = {best_scale:.6f}, mse: {(f1 + f2) / 2:.6f}")
+            print(f"     - scale search: min = {best_scale:.6f}, mse: {best_mse.item():.6f}")
 
-    devices = quant_args["devices"]
     for device in devices:
         torch.cuda.synchronize(device)
 
-    return best_scale, (f1 + f2) / 2
+    return best_scale, best_mse
 
 
 def block_rms(x: torch.Tensor, dim: int, keepdim: bool = False, blocksize: int = 32):
@@ -926,6 +1223,7 @@ def regularize(
         g_scale, mse_scale = g_scale_gss(weight, False, quant_args, pb = pb)
     else:
         g_scale = 1.0
+        mse_scale = None
     weight *= g_scale
     su /= g_scale
 
@@ -935,7 +1233,7 @@ def regularize(
     if verbose:
         print(f"     - su/sv std: {su.std().item():.6f}   {sv.std().item():.6f}")
         print(f"     - global scale: {g_scale:.6f}")
-        print(f"     - sample mse: {mse_scale.item():.6f}")
+        if mse_scale is not None: print(f"     - sample mse: {mse_scale.item():.6f}")
         print(f"     - apply_out_scales: {str(apply_out_scales)}")
 
     return apply_out_scales, weight, g_scale, su, sv
@@ -1072,15 +1370,6 @@ def quantize_exl3(
         # Metrics
         if not q_fallback:
             try:
-                def block_trace(A, B, block_size = 1024):
-                    total = 0.0
-                    for j_start in range(0, B.shape[1], block_size):
-                        j_end = min(j_start + block_size, B.shape[1])
-                        B_block = B[:, j_start:j_end]
-                        A_j_block = A[j_start:j_end, :]
-                        partial = torch.einsum("ik,ij,jk->", A, B_block, A_j_block)
-                        total += partial.item()
-                    return total
                 E = weight_r - weight_q  # may run on CPU
                 W = weight_r
                 Hd = H.to(device)
@@ -1149,3 +1438,255 @@ def quantize_exl3(
         })
 
     return weight_q, proxy_err, out_tensors
+
+
+# Pinned staging buffers for _WeightStager, two per target device so an upload can be in
+# flight while the next host-side copy fills the other buffer. Grown to the largest tensor
+# seen; a worker thread owns its device, so per-device keying is contention-free
+_stage_bufs = {}
+_stage_bufs_lock = threading.Lock()
+
+def _get_stage_buf(device_index: int, slot: int, nbytes: int):
+    key = (device_index, slot)
+    with _stage_bufs_lock:
+        buf = _stage_bufs.get(key)
+        if buf is None or buf[0].numel() < nbytes:
+            buf = (torch.empty(nbytes, dtype = torch.uint8, pin_memory = True),
+                   torch.cuda.Event())
+            _stage_bufs[key] = buf
+        return buf
+
+
+class _WeightStager:
+    """
+    Stages CPU-swapped weights to the device through pinned buffers on a side stream, one
+    tensor ahead of consumption, casting to fp32 on the device. Replaces the former CPU-side
+    .float() + pageable synchronous upload: half the PCIe bytes (checkpoints are fp16/bf16),
+    pinned bandwidth, and the copy overlaps the previous tensor's regularization.
+    """
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.copy_stream = torch.cuda.Stream(device = device)
+        self.slot = 0
+        self.pending = {}
+
+    def prefetch(self, t: int, w: torch.Tensor):
+        if t in self.pending:
+            return
+        if w.is_cuda:
+            self.pending[t] = (w if w.device == self.device else w.to(self.device), None)
+            return
+        nbytes = w.numel() * w.element_size()
+        buf, reuse_ev = _get_stage_buf(self.device.index, self.slot, nbytes)
+        self.slot ^= 1
+        # The buffer's previous async upload must have drained before the host memcpy refills it
+        reuse_ev.synchronize()
+        pin = buf[:nbytes].view(w.dtype).view(w.shape)
+        pin.copy_(w)
+        with torch.cuda.stream(self.copy_stream):
+            # dev_w MUST be allocated on the copy stream.
+            dev_w = torch.empty(w.shape, dtype = w.dtype, device = self.device)
+            dev_w.copy_(pin, non_blocking = True)
+            reuse_ev.record(self.copy_stream)
+        ev = torch.cuda.Event()
+        ev.record(self.copy_stream)
+        self.pending[t] = (dev_w, ev)
+
+    def get(self, t: int, w: torch.Tensor) -> torch.Tensor:
+        self.prefetch(t, w)
+        dev_w, ev = self.pending.pop(t)
+        if ev is not None:
+            torch.cuda.current_stream(self.device).wait_event(ev)
+            # The block belongs to the copy stream's pool; mark its use on the consuming stream
+            # so its eventual free isn't recycled under a later async upload
+            dev_w.record_stream(torch.cuda.current_stream(self.device))
+        return dev_w.float() if dev_w.dtype != torch.float else dev_w
+
+
+def quantize_exl3_batch(
+    weights: list[torch.Tensor],
+    H_datas: list[dict],
+    quant_args_list: list[dict],
+    progress_str: str | None = None,
+    verbose: bool = False,
+):
+    """
+    Quantize a group of same-K linears together, batching the scale search and the LDLQ recursion so the
+    quantize_tiles kernel sees large batches instead of one small tensor's worth of tiles per step.
+
+    Two layouts, chosen by whether the H_data dicts are the same object:
+      - shared Hessian (e.g. all gate/up projections of a block-sparse MLP, or fused q/k/v): the regularized
+        weights are concatenated along out_features and run through a single ldlq() pass with the shared L.
+        This is exact: LDLQ treats columns independently given L, and su (drawn per qmap) is identical
+      - distinct Hessians over same-shape tensors (e.g. per-expert down projections): weights are stacked and
+        run through ldlq_batched() with per-tensor L
+
+    RNG is re-seeded per tensor (finalize's su draw on first call for the qmap, then the per-tensor sv draw),
+    so per-tensor results should match quantize_exl3() in the wider matmuls. Tensors whose Hessian fails to
+    finalize (q_fallback) are routed through quantize_exl3() individually.
+
+    :return:
+        list of (proxy_err, out_tensors) per input tensor; quant_args_list entries are updated in place like
+        quantize_exl3 updates quant_args
+    """
+    n_t = len(weights)
+    qa0 = quant_args_list[0]
+    devices = qa0["devices"]
+    device = torch.device(devices[0])
+    shared_H = all(hd is H_datas[0] for hd in H_datas)
+    assert shared_H or all(w.shape == weights[0].shape for w in weights)
+    assert all(w.shape[0] == weights[0].shape[0] for w in weights)
+    assert all(qa["K"] == qa0["K"] for qa in quant_args_list)
+
+    size_k = weights[0].shape[0]
+    tiles_k = size_k // 16
+    results: list = [None] * n_t
+
+    progress_text = None if not progress_str else progress_str.replace("<step>", "Preparing")
+    with ProgressBar(progress_text, 100) as pb:
+
+        # Finalize Hessians, replicating the serial path's per-tensor RNG stream. Fallback tensors are
+        # handled individually by quantize_exl3
+        finalized = []
+        batch_idx = []
+        for t in range(n_t):
+            qa = quant_args_list[t]
+            if "seed" in qa:
+                torch.manual_seed(qa["seed"])
+            q_fallback, H, L, su, H_diag = finalize_capture_H(H_datas[t], qa, verbose)
+            if q_fallback:
+                finalized.append(None)
+            else:
+                finalized.append((H, L, su, H_diag))
+                batch_idx.append(t)
+
+        for t in range(n_t):
+            if finalized[t] is None:
+                results[t] = quantize_exl3(weights[t].float(), H_datas[t], quant_args_list[t], False, None, verbose)[1:]
+
+        if not batch_idx:
+            return results
+
+        # Regularize each tensor with the scale search deferred, then search all scales in one
+        # batch. Weights arrive in checkpoint precision on the CPU; the stager uploads tensor
+        # t+1 while tensor t regularizes and casts to fp32 on the device
+        stager = _WeightStager(device)
+        stager.prefetch(batch_idx[0], weights[batch_idx[0]])
+        regs = {}
+        for bi, t in enumerate(batch_idx):
+            qa = quant_args_list[t]
+            if "seed" in qa:
+                torch.manual_seed(qa["seed"])
+            H, L, su, H_diag = finalized[t]
+            weight = stager.get(t, weights[t])
+            if bi + 1 < len(batch_idx):
+                stager.prefetch(batch_idx[bi + 1], weights[batch_idx[bi + 1]])
+            if su.is_cuda:
+                su = su.to(device)
+            if H_diag is not None and H_diag.is_cuda:
+                H_diag = H_diag.to(device)
+            sv = (torch.randn(weight.shape[1], device = device).sign() + 1e-5).sign().to(torch.float).unsqueeze(0)
+            apply_out_scales, weight_r, _, su, sv = regularize(
+                weight, su, sv, qa, verbose, H_diag, None, skip_g_scale = True)
+            regs[t] = [weight_r, su, sv, apply_out_scales]
+            weights[t] = None
+
+        samples = [sample_scale_tiles(regs[t][0]) for t in batch_idx]
+        scales = g_scale_search_batch(samples, qa0)
+        del samples
+        g_scales = {}
+        for t, (g_scale, _) in zip(batch_idx, scales):
+            regs[t][0] *= g_scale
+            regs[t][1] /= g_scale
+            g_scales[t] = g_scale
+        pb.update(100)
+
+        progress_text = None if not progress_str else progress_str.replace("<step>", "Quantizing")
+        pb.new_task(progress_text, tiles_k)
+
+        # Quantize
+        if shared_H:
+            # A shared H_data serves many groups spread over several device threads; cache the
+            # device copies of L (and H, below) in the dict so each device pays the transfer
+            # once per layer instead of once per group. A benign race can duplicate a copy;
+            # the loser's tensor is simply collected
+            dev_cache = H_datas[batch_idx[0]].setdefault("dev_cache", {})
+            L = dev_cache.get(("L", device.index))
+            if L is None:
+                L = finalized[batch_idx[0]][1].to(device)
+                dev_cache[("L", device.index)] = L
+            widths = [regs[t][0].shape[1] for t in batch_idx]
+            weight_r_cat = torch.cat([regs[t][0] for t in batch_idx], dim = 1)
+            for t in batch_idx:
+                regs[t][0] = None
+            weight_q_cat, encoded_cat = ldlq(weight_r_cat, L, qa0, pb)
+            L = None   # device copy stays cached in H_data for the layer's remaining groups
+            weight_rs = list(torch.split(weight_r_cat, widths, dim = 1))
+            weight_qs = list(torch.split(weight_q_cat, widths, dim = 1))
+            encodeds = list(torch.split(encoded_cat, [w // 16 for w in widths], dim = 1))
+        else:
+            Ls = torch.stack([finalized[t][1].to(device) for t in batch_idx])
+            weight_r_stack = torch.stack([regs[t][0] for t in batch_idx])
+            for t in batch_idx:
+                regs[t][0] = None
+            weight_q_stack, encoded_stack = ldlq_batched(weight_r_stack, Ls, qa0, pb)
+            del Ls
+            weight_rs = list(weight_r_stack.unbind(0))
+            weight_qs = list(weight_q_stack.unbind(0))
+            encodeds = list(encoded_stack.unbind(0))
+
+        pb.update(tiles_k)
+
+        # Per-tensor metrics and packing
+        Hd = None
+        for bi, t in enumerate(batch_idx):
+            qa = quant_args_list[t]
+            _, su, sv, apply_out_scales = regs[t]
+            if shared_H:
+                if Hd is None:
+                    Hd = dev_cache.get(("H", device.index))
+                    if Hd is None:
+                        Hd = finalized[t][0].to(device)
+                        dev_cache[("H", device.index)] = Hd
+            else:
+                Hd = finalized[t][0].to(device)
+            try:
+                E = weight_rs[bi] - weight_qs[bi]
+                num = block_trace(E, Hd)
+                E = None
+                den = block_trace(weight_rs[bi], Hd)
+                proxy_err = num / max(den, 1e-8)
+            except torch.OutOfMemoryError:
+                E = None
+                proxy_err = -1.0
+            weight_rs[bi] = None
+            weight_qs[bi] = None
+
+            suh = su.flatten().contiguous().to(dtype = torch.half, copy = True)
+            svh = sv.flatten().contiguous().to(dtype = torch.half, copy = True)
+            trellis = pack_trellis(encodeds[bi].contiguous(), qa)
+            encodeds[bi] = None
+
+            out_tensors = {
+                "suh": suh,
+                "svh": svh,
+                "trellis": trellis,
+            }
+            if qa.get("mcg"):
+                out_tensors.update({
+                    "mcg": torch.tensor(codebook_mcg_mult, dtype = torch.uint32).view(torch.int)
+                })
+            if qa.get("mul1"):
+                out_tensors.update({
+                    "mul1": torch.tensor(codebook_mul1_mult, dtype = torch.uint32).view(torch.int)
+                })
+
+            qa.update({
+                "apply_out_scales": apply_out_scales,
+                "g_scale": g_scales[t],
+                "q_fallback": False,
+            })
+            results[t] = (proxy_err, out_tensors)
+
+    return results

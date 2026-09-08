@@ -4,7 +4,10 @@ from .apertus import ApertusModel
 from .cohere import CohereModel
 from .cohere2 import Cohere2Model
 from .decilm import DeciLMModel
+from .deepseek_v3 import DeepseekV3Model
+from .deepseek_v4 import DeepseekV4Model
 from .dflash import DFlashModel
+from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
 from .ernie4_5_moe import Ernie4_5MoEModel
@@ -16,11 +19,14 @@ from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
+from .glm_moe_dsa import GlmMoeDsaModel
+from .glm5_next import Glm5NextModel
 from .gpt_oss import GptOssModel
 from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
+from .laguna import LagunaModel
 from .lfm2_moe import Lfm2MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
@@ -29,7 +35,8 @@ from .ministral3 import Ministral3Model
 from .mistral import MistralModel
 from .mistral3 import Mistral3Model
 from .mixtral import MixtralModel
-from .nanochat import NanoChatModel
+from .muse_glimmer import MuseGlimmerTextModel
+from .muse_glimmer_assistant import MuseGlimmerAssistantModel
 from .nemotronh import NemotronHModel
 from .olmo3 import Olmo3Model
 from .olmohybrid import OlmoHybridModel
@@ -39,6 +46,7 @@ from .qwen2 import Qwen2Model
 from .qwen2_5_vl import Qwen2_5VLModel
 from .qwen3 import Qwen3Model
 from .qwen3_5 import Qwen3_5Model, Qwen3_5MoeModel, Qwen3_5VLModel, Qwen3_5VLMoeModel
+from .qwen4_exp import Qwen4ExpModel
 from .qwen3_moe import Qwen3MoeModel
 from .qwen3_next import Qwen3NextModel
 from .qwen3_vl import Qwen3VLModel
@@ -61,7 +69,10 @@ ARCHITECTURES = {
         CohereModel,
         Cohere2Model,
         DeciLMModel,
+        DeepseekV3Model,
+        DeepseekV4Model,
         DFlashModel,
+        DFlashLagunaModel,
         Dots1Model,
         Ernie4_5Model,
         Ernie4_5MoEModel,
@@ -75,11 +86,14 @@ ARCHITECTURES = {
         Glm4MoeModel,
         Glm4VModel,
         Glm4VMoeModel,
+        GlmMoeDsaModel,
+        Glm5NextModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,
         HyperClovaxModel,
         IQuestCoderModel,
+        LagunaModel,
         Lfm2MoeModel,
         LlamaModel,
         MiMoModel,
@@ -88,7 +102,8 @@ ARCHITECTURES = {
         MistralModel,
         Mistral3Model,
         MixtralModel,
-        NanoChatModel,
+        MuseGlimmerTextModel,
+        MuseGlimmerAssistantModel,
         NemotronHModel,
         Olmo3Model,
         OlmoHybridModel,
@@ -105,6 +120,7 @@ ARCHITECTURES = {
         Qwen3NextModel,
         Qwen3VLModel,
         Qwen3VLMoeModel,
+        Qwen4ExpModel,
         SeedOssModel,
         SmolLM3Model,
         SolarOpenMoeModel,

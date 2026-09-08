@@ -12,6 +12,8 @@ from ..model.model_tp_alloc import TPAllocation
 from .multilinear import MultiLinear
 from ..util.tensor import g_tensor_cache
 
+MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/mlp.h and block_sparse_mlp.py
+
 class MLP(Module):
 
     def __init__(
@@ -35,7 +37,6 @@ class MLP(Module):
         pad_to = 128,
         ups: list[Linear | Module] = None,
         downs: list[Linear | Module] = None,
-        interm_scale: float | None = None,
         select_hq_bits: int = 0,
         qbits_key: str = "bits"
     ):
@@ -50,8 +51,6 @@ class MLP(Module):
         self.intermediate_size = intermediate_size
         self.intermediate_split_size = intermediate_split_size
         self.out_size = out_size or hidden_size
-        self.interm_scale = interm_scale
-        self.interm_rscale = None if interm_scale is None else 1.0 / interm_scale
 
         fkey, frange_up = None, None
 
@@ -146,6 +145,7 @@ class MLP(Module):
         match activation_fn:
             case "silu": self.activation_fn_call = F.silu
             case "gelu": self.activation_fn_call = lambda x: F.gelu(x, approximate = "tanh")
+            case "gelu_exact": self.activation_fn_call = F.gelu
             case "quick_gelu": self.activation_fn_call = lambda x: x * torch.sigmoid(1.702 * x)
             case "relu2": self.activation_fn_call = lambda x: torch.square(F.relu(x))
             case "xielu": self.activation_fn_call = self.act_xielu
@@ -284,14 +284,10 @@ class MLP(Module):
             # TODO: mixed precision activation kernel?
 
             a = self.activation_fn_call(u)
-            if self.interm_rscale is not None:
-                a *= self.interm_rscale
             if self.interm_dtype == torch.float:
                 a = a.half()
 
             d_ = self.downs[s].forward(a, params)
-            if self.interm_scale is not None:
-                d_ *= self.interm_scale
 
             if d is None: d = d_
             else: d += d_
@@ -637,6 +633,7 @@ class GatedMLP(Module):
                 self.gates[load_slice].inner.K,
                 self.gates[load_slice].out_features,
                 self.gates[load_slice].inner.mul1 and self.ups[load_slice].inner.mul1,
+                self.device,
             )
         ):
             self.multi_gu[load_slice] = MultiLinear(self.device, [self.gates[load_slice], self.ups[load_slice]])
@@ -656,9 +653,10 @@ class GatedMLP(Module):
             if mgu is not None or can_separate:
                 out_f = mgu.out_features if mgu is not None else g0.out_features
                 self.bsz1_pa_args = [
-                    (device, (2, 1, self.hidden_size), self.interm_dtype, "gu"),
-                    (device, (2, 1, out_f), self.interm_dtype, "a1"),
-                    (device, (1, 1, 1, out_f), torch.half, "a2")
+                    (device, (2, MAX_BSZN, self.hidden_size), self.interm_dtype, "gu"),
+                    (device, (2, MAX_BSZN, out_f), self.interm_dtype, "a1"),
+                    (device, (1, MAX_BSZN, out_f), torch.half, "a2"),
+                    (device, (1, MAX_BSZN, out_f), torch.half, "down_xh"),
                 ]
                 self.bc = ext.BC_GatedMLP(
                     *(g_tensor_cache.get(*arg) for arg in self.bsz1_pa_args),
@@ -714,10 +712,10 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.bc is not None and bsz == 1 and q_len == 1:
+                if self.bc is not None and bsz * q_len <= MAX_BSZN:
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-                    x = x.view(1, bsz * q_len, dim)
-                    self.bc.run_bsz1(x, d.view(x.shape))
+                    xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
+                    self.bc.run_bszN(xv, d.view(xv.shape))
 
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)
@@ -731,11 +729,11 @@ class GatedMLP(Module):
                     del d_
 
                 else:
-                    x = x.view(1, bsz * q_len, dim)
+                    xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     guh = torch.empty((2, bsz * q_len, dim), dtype = self.interm_dtype, device = x.device)
                     gu = torch.empty((2, bsz * q_len, self.multi_gu[s].out_features), dtype = self.interm_dtype, device = x.device)
                     ext.exl3_mgemm(
-                        x,
+                        xv,
                         self.multi_gu[s].ptrs_trellis,
                         gu,
                         self.multi_gu[s].ptrs_suh,
@@ -749,8 +747,8 @@ class GatedMLP(Module):
                         self.multi_gu[s].mul1,
                         -1,
                         -1,
-                        0
-                    )
+                        0,
+                        1, None, None)
                     g = gu[0].view(bsz, q_len, self.multi_gu[s].out_features)
                     u = gu[1].view(bsz, q_len, self.multi_gu[s].out_features)
 

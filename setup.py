@@ -1,6 +1,7 @@
-from setuptools import setup
 import importlib.util
 import os
+
+from setuptools import setup
 
 if torch := importlib.util.find_spec("torch") is not None:
     from torch.utils import cpp_extension
@@ -25,8 +26,13 @@ extra_cuda_cflags = [
 ]
 
 if windows:
-    extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN"]
-    extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-Xcompiler=/Zc:preprocessor"]
+    # NOMINMAX: windows.h otherwise defines min/max function-like macros that break every
+    # std::min/std::max call site parsed after it (WIN32_LEAN_AND_MEAN does not suppress them).
+    # Defined globally so it holds regardless of include order in any TU.
+    # No -std flags here: torch's cpp_extension appends its own (unconditionally on the Windows
+    # nvcc path), and a second -std argument is a fatal nvcc error, not an override.
+    extra_cflags += ["/Ox", "/Zc:preprocessor", "/DWIN32_LEAN_AND_MEAN", "/DNOMINMAX"]
+    extra_cuda_cflags += ["-DWIN32_LEAN_AND_MEAN", "-DNOMINMAX", "-Xcompiler=/Zc:preprocessor"]
     if ext_debug:
         extra_cflags += ["/Zi"]
         extra_cuda_cflags += []
@@ -57,8 +63,6 @@ sources = [
     if file.endswith(('.c', '.cpp', '.cu'))
 ]
 
-print (sources)
-
 setup_kwargs = (
     {
         "ext_modules": [
@@ -75,60 +79,7 @@ setup_kwargs = (
     else {}
 )
 
-version_py = {}
-with open("exllamav3/version.py", encoding="utf8") as fp:
-    exec(fp.read(), version_py)
-version = version_py["__version__"]
-print("Version:", version)
-
 setup(
-    name="exllamav3",
-    version=version,
-    packages=[
-        "exllamav3",
-        "exllamav3.generator",
-        "exllamav3.generator.sampler",
-        "exllamav3.generator.filter",
-        "exllamav3.conversion",
-        "exllamav3.conversion.standard_cal_data",
-        "exllamav3.integration",
-        "exllamav3.architecture",
-        "exllamav3.architecture.mm_processing",
-        "exllamav3.model",
-        "exllamav3.modules",
-        "exllamav3.modules.attention_fn",
-        "exllamav3.modules.arch_specific",
-        "exllamav3.modules.gated_delta_net_fn",
-        "exllamav3.modules.quant",
-        "exllamav3.modules.quant.exl3_lib",
-        "exllamav3.tokenizer",
-        "exllamav3.cache",
-        "exllamav3.loader",
-        "exllamav3.util",
-    ],
-    url="https://github.com/turboderp-org/exllamav3",
-    license="MIT",
-    author="turboderp",
-    install_requires=[
-        "torch>=2.6.0",
-        "tokenizers>=0.21.1",
-        "numpy>=2.1.0",
-        "rich",
-        "typing_extensions",
-        "safetensors>=0.3.2",
-        "ninja",
-        "pillow",
-        "pyyaml",
-        "marisa_trie",
-        "kbnf>=0.4.2",
-        "pydantic",
-        "formatron>=0.5.0",
-        "flash-linear-attention>=0.5.0",
-    ],
-    include_package_data=True,
-    package_data = {
-        "": ["py.typed"],
-    },
     verbose=verbose,
     **setup_kwargs,
 )

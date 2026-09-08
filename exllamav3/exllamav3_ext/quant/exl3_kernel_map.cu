@@ -54,7 +54,7 @@ int select_gemm_shape(int cc, int size_m, int size_k, int size_n, int K, bool mu
             if (mod_256) return 3;
             return 2;
 
-        // case CC_HOPPER:
+        case CC_HOPPER:
         case CC_BLACKWELL:
             if ((K == 4 || K == 2) && !multi)
             {
@@ -146,7 +146,7 @@ fp_exl3_gemm_kernel select_exl3_gemm_kernel
 {
     int shape_idx = force_shape_idx <= 0 ? select_gemm_shape(cc, size_m, size_k, size_n, K, false, 1, 1) : force_shape_idx;
 
-    TORCH_CHECK(shape_idx > 0, "exl3_gemm: no compatible kernel");
+    TORCH_CHECK(shape_idx > 0 && shape_idx <= EXL3_GEMM_NUM_SHAPES, "exl3_gemm: no compatible kernel (or invalid forced shape index)");
     if (out_shape_idx) *out_shape_idx = shape_idx;
     if (out_block_dim) *out_block_dim = exl3_gemm_blockdim[shape_idx];
 

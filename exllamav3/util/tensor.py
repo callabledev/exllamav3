@@ -1,5 +1,6 @@
 from __future__ import annotations
 import torch
+from .device_copy import to_device
 
 class SeqTensor:
 
@@ -151,7 +152,7 @@ def get_for_device(
             v._static_dev_copies = scache
         dv = scache.get(device)
         if dv is None:
-            dv = v.to(device)
+            dv = to_device(v, device)
             scache[device] = dv
     else:
         # Pinned sources upload asynchronously: the copy is stream-ordered ahead of the kernels
@@ -159,7 +160,7 @@ def get_for_device(
         # must not refill them until a sync point (the generator syncs every iteration when
         # collecting sampled tokens)
         nb = v.device.type == "cpu" and v.is_pinned()
-        dv = v.to(device, non_blocking = nb)
+        dv = to_device(v, device, non_blocking = nb)
     cache[cache_key] = (v, dv)
     return dv
 
@@ -226,6 +227,14 @@ class GTensorCache:
             refc, v = self.cache[key]
         self.cache[key] = (refc + 1, v)
         return v
+
+    def get_bucketed(self, device, numel, dtype, x = ""):
+        """Flat backing rounded up to the next power of two, sliced to numel. For workspaces
+        whose size is parameterized by a runtime shape (batch size, query length, split
+        count): nearby sizes share one kept entry instead of ratcheting a new allocation per
+        distinct size, and the total kept per tag is bounded by 2x the largest use."""
+        nb = 1 << max(numel - 1, 0).bit_length()
+        return self.get(device, (nb,), dtype, x)[:numel]
 
     # def drop(self, device, shape, dtype, x = ""):
     #     key = self.make_key(device, shape, dtype, x)
