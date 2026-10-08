@@ -109,7 +109,9 @@ void run_cpu_reduce_jobs
                 break;
             if (++spins < 65536)
             {
-                #ifdef __linux__
+                #if defined(__aarch64__) || defined(__arm__)  // EXL3_AARCH64_PAUSE
+                    asm volatile("yield" ::: "memory");
+                #elif defined(__linux__)
                     __builtin_ia32_pause();
                 #else
                     _mm_pause();
@@ -326,14 +328,15 @@ void pg_all_reduce_cpu_kernel
 
     // Block-uniform gate on the CPU release counter reaching `target` (plain >= like the rest of
     // the stage machinery; the sequence would need 2^31 chunks to wrap). The last observed value
-    // is cached: when the CPU is ahead, most chunks pass with no pinned-memory read at all
+    // is cached: when the CPU is ahead, most chunks pass with no pinned-memory read at all.
+    // The fast-path test reads a per-thread copy of the cached value, refreshed only behind the
+    // barrier, so every thread takes the same branch
     __shared__ bool s_wait_ok;
     __shared__ uint32_t s_cpu_seen;
-    if (t == 0) s_cpu_seen = 0;
-    __syncthreads();
+    uint32_t cpu_seen = 0;
     auto wait_cpu = [&] (uint32_t target) -> bool
     {
-        if (s_cpu_seen >= target) return true;
+        if (cpu_seen >= target) return true;
         if (t == 0)
         {
             s_wait_ok = true;
@@ -342,7 +345,8 @@ void pg_all_reduce_cpu_kernel
             while (true)
             {
                 uint32_t ep = (uint32_t)ldg_acquire_sys_u32(&ctx->cpusum_stage_cpu);
-                if (ep >= target) { s_cpu_seen = ep; break; }
+                s_cpu_seen = ep;
+                if (ep >= target) break;
                 __nanosleep(sleep);
                 if (sleep < SYNC_MAX_SLEEP) sleep <<= 1;
                 else if (check_timeout(ctx, deadline, "pg_all_reduce_cpu_kernel"))
@@ -354,6 +358,7 @@ void pg_all_reduce_cpu_kernel
             }
         }
         __syncthreads();
+        cpu_seen = s_cpu_seen;
         return s_wait_ok;
     };
 

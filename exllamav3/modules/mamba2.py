@@ -11,10 +11,6 @@ from .gated_delta_net import GDNLayerState
 from .gated_delta_net_fn import causal_conv1d_update
 from .attention_fn.bc_attn import MAX_BSZ as _BC_MAX_BSZ, MAX_QLEN as _BC_MAX_QLEN
 
-try:
-    from fla.ops.simple_gla import chunk_simple_gla
-except ModuleNotFoundError:
-    chunk_simple_gla = None
 
 
 def torch_recurrent_mamba2(
@@ -363,7 +359,7 @@ class Mamba2(Module):
         if self.num_k_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                params["backend"].all_reduce(x, False)
+                self.tp_collect(params["backend"], x, False)
             return to2(x, out_dtype, self.out_dtype)
 
         bsz, seqlen, _ = x.shape
@@ -410,7 +406,7 @@ class Mamba2(Module):
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
             self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
             if self.tp_reduce:
-                params["backend"].all_reduce(y)
+                self.tp_collect(params["backend"], y)
             return to2(y, out_dtype, self.out_dtype)
 
         # Input projection, flat split [z, xBC, dt]. Under TP the dt section is replicated on
@@ -439,7 +435,7 @@ class Mamba2(Module):
         )
 
         # SSM
-        if seqlen >= self.num_v_heads and chunk_simple_gla is not None and not save_history:
+        if seqlen >= self.num_v_heads and not save_history:
             core_attn_out = self.ssd_chunked(mixed_xbc, dt, g, recurrent_state, save_state, params, bsz, seqlen)
         else:
             core_attn_out = torch.empty(
@@ -480,14 +476,16 @@ class Mamba2(Module):
 
         # TP reduction
         if self.tp_reduce:
-            params["backend"].all_reduce(x)
+            self.tp_collect(params["backend"], x)
 
         return to2(x, out_dtype, self.out_dtype)
 
 
     def ssd_chunked(self, mixed_xbc, dt, g, recurrent_state, save_state, params, bsz, seqlen):
         # Mamba2 (SSD) prefill: chunk_simple_gla computes the same recurrence without the
-        # delta-rule correction. No GQA support, so B/C expand to all heads
+        # delta-rule correction. No GQA support, so B/C expand to all heads. The vendored fla kernels
+        # probe the devices at import, so import on first use
+        from ..vendor.fla import chunk_simple_gla
         x_v, B, C = torch.split(mixed_xbc, [self.v_dim, self.k_dim, self.k_dim], dim = -1)
         x_v = x_v.view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
         q = C.view(bsz, seqlen, self.num_k_heads, self.k_head_dim).repeat_interleave(self.num_v_groups, dim = 2)
@@ -717,6 +715,7 @@ class Mamba2(Module):
         module.device = device
         if not kwargs.get("skip_reduction"):
             module.tp_reduce = True
+            module.tp_owner = module.tp_single_owner(local_context, key)
 
         module.load_local(device)
         torch.cuda.synchronize()

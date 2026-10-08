@@ -7,6 +7,7 @@ from .decilm import DeciLMModel
 from .deepseek_v3 import DeepseekV3Model
 from .deepseek_v4 import DeepseekV4Model
 from .dflash import DFlashModel
+from .dflash2 import DFlash2Model
 from .dflash_laguna import DFlashLagunaModel
 from .dots1 import Dots1Model
 from .ernie4_5 import Ernie4_5Model
@@ -19,6 +20,7 @@ from .glm4 import Glm4Model
 from .glm4_moe import Glm4MoeModel
 from .glm4v import Glm4VModel
 from .glm4v_moe import Glm4VMoeModel
+from .glm4_moe_lite import Glm4MoeLiteModel
 from .glm_moe_dsa import GlmMoeDsaModel
 from .glm5_next import Glm5NextModel
 from .gpt_oss import GptOssModel
@@ -26,10 +28,13 @@ from .hcxvisionv2 import HCXVisionV2Model
 from .hy_v3 import HyV3Model
 from .hyperclovax import HyperClovaxModel
 from .iquestcoder import IQuestCoderModel
+from .kimi_linear import KimiLinearModel
 from .laguna import LagunaModel
+from .lfm2 import Lfm2Model
 from .lfm2_moe import Lfm2MoeModel
 from .llama import LlamaModel
 from .mimo import MiMoModel
+from .mimo_v2 import MiMoV2Model
 from .minimax_m2 import MiniMaxM2Model
 from .ministral3 import Ministral3Model
 from .mistral import MistralModel
@@ -54,6 +59,7 @@ from .qwen3_vl_moe import Qwen3VLMoeModel
 from .seedoss import SeedOssModel
 from .smollm3 import SmolLM3Model
 from .solar_open_moe import SolarOpenMoeModel
+from .spark2_5 import Spark2_5Model
 from .step3_5 import Step3_5Model
 from .step3_7 import Step3_7Model
 
@@ -72,6 +78,7 @@ ARCHITECTURES = {
         DeepseekV3Model,
         DeepseekV4Model,
         DFlashModel,
+        DFlash2Model,
         DFlashLagunaModel,
         Dots1Model,
         Ernie4_5Model,
@@ -86,17 +93,21 @@ ARCHITECTURES = {
         Glm4MoeModel,
         Glm4VModel,
         Glm4VMoeModel,
+        Glm4MoeLiteModel,
         GlmMoeDsaModel,
         Glm5NextModel,
+        KimiLinearModel,
         GptOssModel,
         HCXVisionV2Model,
         HyV3Model,
         HyperClovaxModel,
         IQuestCoderModel,
         LagunaModel,
+        Lfm2Model,
         Lfm2MoeModel,
         LlamaModel,
         MiMoModel,
+        MiMoV2Model,
         MiniMaxM2Model,
         Ministral3Model,
         MistralModel,
@@ -124,6 +135,7 @@ ARCHITECTURES = {
         SeedOssModel,
         SmolLM3Model,
         SolarOpenMoeModel,
+        Spark2_5Model,
         Step3_5Model,
         Step3_7Model,
     ]

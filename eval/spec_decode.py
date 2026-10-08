@@ -183,6 +183,8 @@ def print_stats(stats_sink):
 
 @torch.inference_mode()
 def main(args):
+    if args.ngram_corpus and args.s_ngram_match_min <= 0:
+        raise ValueError("-ngram_corpus requires -ngram_min > 0")
     model, config, cache, tokenizer, draft_model, draft_config, draft_cache = model_init.init(
         args,
         min_draft_len = args.s_ngram_draft_length
@@ -206,7 +208,7 @@ def main(args):
             model = model,
             cache = cache,
             tokenizer = tokenizer,
-            max_chunk_size = 4096,
+            max_chunk_size = args.chunk_size,
         )
         result_baseline = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens)
 
@@ -219,11 +221,12 @@ def main(args):
             cache = cache,
             tokenizer = tokenizer,
             ngram_match_min = args.s_ngram_match_min,
+            ngram_corpus = args.ngram_corpus,
             num_draft_tokens = args.s_ngram_draft_length,
             dynamic_draft_tokens = args.dynamic_draft,
             draft_confidence = args.draft_confidence,
             record_draft_stats = stats_sink is not None,
-            max_chunk_size = 4096,
+            max_chunk_size = args.chunk_size,
         )
         result_ngram = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
         if args.temperature:
@@ -243,7 +246,7 @@ def main(args):
             draft_confidence = args.draft_confidence,
             dynamic_draft_tokens = args.dynamic_draft,
             record_draft_stats = stats_sink is not None,
-            max_chunk_size = 4096,
+            max_chunk_size = args.chunk_size,
         )
         result_draft = measure(generator, tokenizer, GreedySampler(), args.max_new_tokens, stats_sink)
         if args.temperature:
@@ -325,6 +328,7 @@ if __name__ == "__main__":
         cache = True,
         add_draft_model_args = True,
         default_autosplit_max_batch_size = 1,
+        default_chunk_size = 4096,
     )
     parser.add_argument("-nbl", "--no_baseline", action = "store_true", help = "Skip baseline measurement")
     parser.add_argument("-ngram_min", "--s_ngram_match_min", type = int, help = "N-gram minimum match length, default = 0 (disabled)", default = 0)

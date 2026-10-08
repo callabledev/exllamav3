@@ -19,6 +19,7 @@ BC_Attention::BC_Attention
     int _num_q_heads,
     int _num_kv_heads,
     int _head_dim,
+    int _v_head_dim,
     int _hidden_size,
     int _hidden_size_padded,
     int _page_size,
@@ -28,7 +29,7 @@ BC_Attention::BC_Attention
     c10::optional<at::Tensor> _kv_ptrs_trellis,
     c10::optional<at::Tensor> _kv_ptrs_suh,
     c10::optional<at::Tensor> _kv_ptrs_svh,
-    int _kv_K,
+    float _kv_K,
     bool _kv_mcg,
     bool _kv_mul1,
     std::shared_ptr<BC_LinearEXL3> _o_proj,
@@ -40,9 +41,16 @@ BC_Attention::BC_Attention
     c10::optional<at::Tensor> _qg_ptrs_trellis,
     c10::optional<at::Tensor> _qg_ptrs_suh,
     c10::optional<at::Tensor> _qg_ptrs_svh,
-    int _qg_K,
+    float _qg_K,
     bool _qg_mcg,
     bool _qg_mul1,
+    c10::optional<at::Tensor> _qkv_ptrs_trellis,
+    c10::optional<at::Tensor> _qkv_ptrs_suh,
+    c10::optional<at::Tensor> _qkv_ptrs_svh,
+    c10::optional<at::Tensor> _qkv_meta,
+    float _qkv_K,
+    bool _qkv_mcg,
+    bool _qkv_mul1,
     c10::optional<at::Tensor> _q_norm,
     c10::optional<at::Tensor> _k_norm,
     float _norm_eps,
@@ -70,6 +78,7 @@ BC_Attention::BC_Attention
     num_q_heads         (_num_q_heads),
     num_kv_heads        (_num_kv_heads),
     head_dim            (_head_dim),
+    v_head_dim          (_v_head_dim),
     hidden_size         (_hidden_size),
     hidden_size_padded  (_hidden_size_padded),
     page_size           (_page_size),
@@ -95,6 +104,13 @@ BC_Attention::BC_Attention
     qg_K                (_qg_K),
     qg_mcg              (_qg_mcg),
     qg_mul1             (_qg_mul1),
+    qkv_ptrs_trellis    (std::move(_qkv_ptrs_trellis)),
+    qkv_ptrs_suh        (std::move(_qkv_ptrs_suh)),
+    qkv_ptrs_svh        (std::move(_qkv_ptrs_svh)),
+    qkv_meta            (std::move(_qkv_meta)),
+    qkv_K               (_qkv_K),
+    qkv_mcg             (_qkv_mcg),
+    qkv_mul1            (_qkv_mul1),
     q_norm              (std::move(_q_norm)),
     k_norm              (std::move(_k_norm)),
     norm_eps            (_norm_eps),
@@ -122,6 +138,25 @@ BC_Attention::BC_Attention
     TORCH_CHECK(gate_mode != 1 || (g_weight && !qg_ptrs_trellis && !g_proj), "BC_Attention: headwise gate requires an fp16 gate weight");
     TORCH_CHECK(!g_weight || gate_mode == 1 || (gate_mode == 2 && !qg_ptrs_trellis && !g_proj), "BC_Attention: fp16 gate weight requires full gate mode without a quantized g projection");
     slots.resize(2 * MAX_BSZ * MAX_QLEN);
+
+    if (qkv_ptrs_trellis)
+    {
+        TORCH_CHECK(qkv_ptrs_suh && qkv_ptrs_svh && qkv_meta, "BC_Attention: incomplete qkv bundle");
+        TORCH_CHECK(gate_mode == 0 || gate_mode == 2 || gate_mode == 3, "BC_Attention: qkv bundle needs gate mode 0, 2 or 3");
+        const at::Tensor& meta = qkv_meta.value();
+        TORCH_CHECK(meta.device().is_cpu() && meta.dtype() == at::kInt && meta.dim() == 2 && meta.size(0) == 5,
+                    "BC_Attention: qkv_meta must be a CPU int32 (5, slices) tensor");
+        int slices = (int) meta.size(1);
+        TORCH_CHECK(qkv_ptrs_trellis.value().size(0) == slices && qkv_ptrs_svh.value().size(0) == slices,
+                    "BC_Attention: qkv pointer tables must have one entry per slice");
+        qkv_num_src = (int) qkv_ptrs_suh.value().size(0);
+        auto dev = qkv_ptrs_trellis.value().device();
+        qkv_size_n = meta.select(0, 2).contiguous().to(dev);
+        qkv_n_stride = meta.select(0, 3).contiguous().to(dev);
+        qkv_had_src = meta.select(0, 4).contiguous().to(dev);
+        int width = meta[2][0].item<int>();
+        qkv_carrier = at::empty({slices, MAX_BSZ * MAX_QLEN, width}, at::TensorOptions().dtype(at::kHalf).device(dev));
+    }
 }
 
 void BC_Attention::set_qsa
@@ -176,6 +211,7 @@ void BC_Attention::configure_slot
     std::shared_ptr<TritonKernel> k_update,
     int block_n,
     int splits_cap,
+    int programs,
     c10::optional<at::Tensor> xp,
     c10::optional<at::Tensor> yp
 )
@@ -224,8 +260,11 @@ void BC_Attention::configure_slot
     s.q4 = s.q.view({bsz, q_len, num_q_heads, head_dim});
     s.k4 = s.kv.select(0, 0).view({bsz, q_len, num_kv_heads, head_dim});
     s.v4 = s.kv.select(0, 1).view({bsz, q_len, num_kv_heads, head_dim});
-    s.o2 = s.o.view({R, num_q_heads * head_dim});
-    s.o4 = s.o.view({bsz, q_len, num_q_heads, head_dim});
+    // The combine kernel writes v_head_dim lanes per head, so o is already the o_proj input
+    // layout (the gate stages assume the full head width and are declined python-side)
+    TORCH_CHECK(v_head_dim == head_dim || gate_mode == 0, "BC_Attention: gates require v_head_dim == head_dim");
+    s.o2 = s.o.view({R, num_q_heads * v_head_dim});
+    s.o4 = s.o.view({bsz, q_len, num_q_heads, v_head_dim});
 
     int n_q = num_q_heads * head_dim;
     if (gate_mode == 1)
@@ -251,11 +290,33 @@ void BC_Attention::configure_slot
         s.g2 = s.gate_b.view({R, n_q});
     }
 
-    int group_size = num_q_heads / num_kv_heads;
-    int block_m = 1; while (block_m < q_len) block_m <<= 1;
-    int block_h = MAX(16 / block_m, 1);
-    int h_blocks = CEIL_DIVIDE(group_size, block_h);
-    s.programs = bsz * num_kv_heads * h_blocks;
+    // Sliced Q/K/V bundle: output pointers into this slot's statics, one per slice
+    if (qkv_ptrs_trellis)
+    {
+        const at::Tensor& meta = qkv_meta.value();
+        int slices = (int) meta.size(1);
+        auto target = meta.accessor<int, 2>();
+        std::vector<int64_t> ptrs(slices);
+        at::Tensor kv2 = s.kv.view({2, R, num_kv_heads * head_dim});
+        for (int j = 0; j < slices; ++j)
+        {
+            void* base;
+            switch (target[0][j])
+            {
+                case 0: base = gate_mode == 3 ? s.qg2.data_ptr() : s.q2.data_ptr(); break;   // interleaved: the full q/g row
+                case 1: base = kv2.select(0, 0).data_ptr(); break;
+                case 2: base = kv2.select(0, 1).data_ptr(); break;
+                case 3: TORCH_CHECK(gate_mode == 2, "BC_Attention: gate slice without a full gate"); base = s.g2.data_ptr(); break;
+                default: TORCH_CHECK(false, "BC_Attention: bad qkv slice target");
+            }
+            ptrs[j] = (int64_t) ((half*) base + target[1][j]);
+        }
+        s.qkv_c_ptrs = at::tensor(ptrs, at::TensorOptions().dtype(at::kLong)).to(s.q.device());
+    }
+
+    // Split / combine grid width: the row layout is the Python side's (triton_paged.decode_row_layout),
+    // which compiled the kernels for it
+    s.programs = programs;
     s.upd_grid = dim3(bsz * q_len, num_kv_heads, 1);
 
     s.graph = std::make_unique<Graph>();
@@ -328,11 +389,12 @@ void BC_Attention::configure_slot_qsa
 
 // Live split configuration from the current block-table bound (same formula as the python
 // dispatch path, so the two produce identical numerics)
+#define SPLIT_MIN_BLOCKS 1   // key blocks per split (was 4): short contexts get more CTAs
 static inline void split_config(int bt_width, int page_size, int q_len, int block_n, int splits_cap,
                                 int* num_splits, int* split_len)
 {
     int bound = bt_width * page_size + q_len;
-    *num_splits = MAX(1, MIN(splits_cap, CEIL_DIVIDE(bound, 4 * block_n)));
+    *num_splits = MAX(1, MIN(splits_cap, CEIL_DIVIDE(bound, SPLIT_MIN_BLOCKS * block_n)));
     *split_len = CEIL_DIVIDE(CEIL_DIVIDE(bound, *num_splits), block_n) * block_n;
 }
 
@@ -376,7 +438,23 @@ void BC_Attention::run_gr
     // Q (and gate) projections into the static buffers
     at::Tensor xh_q = xh_flat.narrow(0, 0, (int64_t) R * hs).view({R, hs});
     bool use_qg_mgemm = gate_mode == 2 && qg_ptrs_trellis.has_value() && R <= 32;
-    if (gate_mode == 3)
+    bool use_qkv = qkv_ptrs_trellis.has_value() && R <= 32;
+    if (use_qkv)
+    {
+        // Q, K, V (and a quantized full gate) as one sliced mgemm; the K/V section below is
+        // skipped. The carrier only supplies the dtype and slice width
+        at::Tensor x3 = x2.view({1, R, hs});
+        at::Tensor xh_b = xh_flat.narrow(0, 0, (int64_t) qkv_num_src * R * hs).view({qkv_num_src, R, hs});
+        at::Tensor carrier = qkv_carrier.narrow(1, 0, R);
+        exl3_mgemm_gr(x3, qkv_ptrs_trellis.value(), carrier, qkv_ptrs_suh.value(), xh_b, qkv_ptrs_svh.value(),
+                      c10::nullopt, c10::nullopt, qkv_K, -1, qkv_mcg, qkv_mul1, -1, -1, 0, graph,
+                      1, qkv_size_n, s.qkv_c_ptrs, qkv_n_stride, qkv_had_src, qkv_num_src);
+        if (gate_mode == 2 && g_weight)
+            hgemm_gr(x2, g_weight.value(), s.g2, graph);
+        if (gate_mode == 3)
+            deinterleave_qg_gr(s.qg2, s.q2, s.g2, head_dim, graph);
+    }
+    else if (gate_mode == 3)
     {
         exl3_gemm_gr(x2, q_proj->trellis, s.qg2, q_proj->suh, xh_q, q_proj->svh, -1, q_proj->mcg, q_proj->mul1, 0, graph);
         if (q_proj->bias)
@@ -419,7 +497,11 @@ void BC_Attention::run_gr
     }
 
     at::Tensor kv2 = s.kv.view({2, R, num_kv_heads * head_dim});
-    if (use_k_as_v)
+    if (use_qkv)
+    {
+        // K and V already written by the sliced bundle
+    }
+    else if (use_k_as_v)
     {
         // V shares the K projection output; copy it out before norm + RoPE modify K in place
         at::Tensor k2 = kv2.select(0, 0);
@@ -669,7 +751,7 @@ void BC_Attention::run_gr
                 (void*) (intptr_t) s.qsa_splits,
                 (void*) s.q.data_ptr(),  // sinks: dead arg, HAS_SINKS = false
             };
-            s.k_qsa_combine->launch(s.qsa_programs, 1, 1, args, stream);
+            s.k_qsa_combine->launch(s.qsa_programs, s.k_qsa_combine->grid_y, 1, args, stream);
         }
     }
     else
@@ -725,7 +807,7 @@ void BC_Attention::run_gr
             // HAS_SINKS), dead arg otherwise
             sinks ? (void*) sinks.value().data_ptr() : (void*) s.q.data_ptr(),
         };
-        s.k_combine->launch(s.programs, 1, 1, args, stream);
+        s.k_combine->launch(s.programs, s.k_combine->grid_y, 1, args, stream);
         if (graph)
         {
             graph->record_param(s.k_combine->handle(), GP_attn_num_splits, 4, 4);
@@ -754,7 +836,7 @@ void BC_Attention::run_gr
     at::Tensor c2 = y2;
     if (hs != hidden_size)
         c2 = s.yp.narrow(0, 0, R);
-    at::Tensor xh_o = xh_flat.narrow(0, 0, (int64_t) R * num_q_heads * head_dim).view({R, num_q_heads * head_dim});
+    at::Tensor xh_o = xh_flat.narrow(0, 0, (int64_t) R * num_q_heads * v_head_dim).view({R, num_q_heads * v_head_dim});
     exl3_gemm_gr(s.o2, o_proj->trellis, c2, o_proj->suh, xh_o, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
     if (o_proj->bias)
         add_gr(c2, o_proj->bias.value(), c2, graph);
@@ -788,8 +870,9 @@ void BC_Attention::run
     TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
 
     // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
-    // captured, then launched below like every later run, with only the I/O pointers patched
-    if (s.runs == 0)
+    // captured, then launched below like every later run, with only the I/O pointers patched.
+    // A disabled graph runs the same C++ path eagerly every time
+    if (s.runs == 0 || s.graph->disabled)
     {
         run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
         s.runs = 1;
@@ -819,8 +902,12 @@ void BC_Attention::run
     if (staged)
         params.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
 
+    bool use_qkv = qkv_ptrs_trellis.has_value() && R <= 32;
+
     // Q / gate projections (an fp16 gate is a cublas node with no patchable sites)
-    if (use_qg_mgemm)
+    if (use_qkv)
+        params.emplace_back(GP_mgemm_A, xptr);   // one sliced mgemm covers q, k, v (and a quantized gate)
+    else if (use_qg_mgemm)
         params.emplace_back(GP_mgemm_A, xptr);
     else
     {
@@ -830,7 +917,11 @@ void BC_Attention::run
     }
 
     // K/V projections
-    if (use_k_as_v)
+    if (use_qkv)
+    {
+        // written by the bundle above
+    }
+    else if (use_k_as_v)
     {
         params.emplace_back(GP_gemm_A, xptr);
     }

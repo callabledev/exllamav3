@@ -1,9 +1,9 @@
 from __future__ import annotations
 import heapq
-import threading
 import torch
 from collections import deque
 from ..constants import PAGE_SIZE
+from ..util.pinned_arena import PinnedArena
 
 
 def _align(n: int, a: int) -> int:
@@ -48,8 +48,9 @@ class CPUPageCache:
             them
 
         :param max_size:
-            Capacity in bytes of pinned system memory. Slots are allocated lazily as pages are pushed, so this
-            is a ceiling, not an up-front allocation
+            Capacity in bytes of pinned system memory, committed and locked up front as one arena (per rank
+            in tensor-parallel mode), so the budget is what the tier occupies and a host that cannot hold it
+            fails here rather than during generation
         """
 
         # A draft cache belongs to the draft model, with its own workers and its own view of which cache ids
@@ -111,7 +112,6 @@ class CPUPageCache:
 
         # phash -> {slot, prev_hash, access_serial, tokens}
         self.entries = {}
-        self.slot_slabs = []
         self.slot_views = []
         self.free_slots = deque()
         # Slots handed out so far. In TP mode this is the only record the main process keeps of them, since the
@@ -128,22 +128,13 @@ class CPUPageCache:
             "dedup_hits": 0,    # pushes skipped because the page was already stored
             "restores": 0,      # pages copied back into the GPU cache at allocation
             "evictions": 0,     # tier entries dropped to make room
-            "cold_allocs": 0,   # pushes that had to pin a slab synchronously (spare pool was empty)
         }
-        # cold_allocs is the sum of the two halves, since a slot can have a local slab and per-rank buffers
-        self._local_cold_allocs = 0
-        self._tp_cold_allocs = 0
 
-        # Transfers run at PCIe speed, but pinning host memory only manages ~2.5 GB/s and serializes with copy
-        # submission on the driver, so the full configured capacity is pinned up front by a background thread
-        # (mirroring the GPU cache, whose full allocation is also committed at load). Pushes that outrun the
-        # pinning thread early in the process fall back to pinning synchronously. Each rank runs the same for
-        # its own shard, so there is nothing to pin here for a cache that is entirely TP.
-        self._spare = deque()
-        self._spare_cond = threading.Condition()
+        # This process's half of every slot: slot i is the slab_size bytes at i * slab_size. Each rank holds
+        # the same for its own shard, so there is nothing to allocate here for a cache that is entirely TP.
+        self.arena = None
         if self.segments:
-            self._alloc_thread = threading.Thread(target = self._alloc_worker, daemon = True)
-            self._alloc_thread.start()
+            self.arena = PinnedArena(self.max_slots * self.slab_size, "CPU page cache")
 
 
     def attach(self, pagetable):
@@ -158,31 +149,20 @@ class CPUPageCache:
         return len(self.entries)
 
 
-    def _make_slab(self):
-        slab = torch.empty((self.slab_size,), dtype = torch.uint8, pin_memory = True)
+    def _make_views(self, slot: int):
+        base = slot * self.slab_size
         views = []
         for t, offset, page_shape, dtype in self.segments:
             nbytes = t[0].numel() * t.element_size()
-            views.append(slab[offset : offset + nbytes].view(dtype).view(page_shape))
-        return slab, views
-
-
-    def _alloc_worker(self):
-        with torch.inference_mode():
-            while True:
-                with self._spare_cond:
-                    while len(self.slot_slabs) + len(self._spare) >= self.max_slots:
-                        self._spare_cond.wait()
-                sv = self._make_slab()  # slow part, outside the lock
-                with self._spare_cond:
-                    self._spare.append(sv)
+            views.append(self.arena.tensor[base + offset : base + offset + nbytes].view(dtype).view(page_shape))
+        return views
 
 
     def _new_slot(self, protect: set | None):
         """
         Index of a slot to write into: a recycled one, a fresh one while the budget allows, or the eviction
-        candidate. The index is the whole identity of a slot, since the ranks key their own buffers by it, so
-        a local slab (when there is one) is appended in lockstep and stays at the matching position.
+        candidate. The index is the whole identity of a slot: it is the position of the slot's slab in this
+        process's arena and in every rank's.
         """
 
         if self.free_slots:
@@ -191,19 +171,7 @@ class CPUPageCache:
             return self._evict_one(protect)
 
         if self.segments:
-            sv = None
-            with self._spare_cond:
-                if self._spare:
-                    sv = self._spare.popleft()
-                    self._spare_cond.notify()
-            if sv is None:
-                sv = self._make_slab()  # slow part, outside the lock
-                self._local_cold_allocs += 1
-                self.metrics["cold_allocs"] = self._local_cold_allocs + self._tp_cold_allocs
-                with self._spare_cond:
-                    self._spare_cond.notify()
-            self.slot_slabs.append(sv[0])
-            self.slot_views.append(sv[1])
+            self.slot_views.append(self._make_views(self.num_slots))
 
         self.num_slots += 1
         return self.num_slots - 1
@@ -298,13 +266,9 @@ class CPUPageCache:
         for v, (t, _, _, _) in zip(self.slot_views[slot] if self.segments else (), self.segments):
             v.copy_(t[page.page_index], non_blocking = True)
         if self.tp:
-            # Each rank copies its own shard of the page. The count of synchronous pins comes back from them,
-            # since that stall happens in the workers, and is added to any this process incurred for a local
-            # slab so the metric stays one number
-            self._tp_cold_allocs = sum(
-                m.tp_cpu_cache_store(ids, slot, page.page_index) for m, ids in self.tp_groups
-            )
-            self.metrics["cold_allocs"] = self._local_cold_allocs + self._tp_cold_allocs
+            # Each rank copies its own shard of the page
+            for m, ids in self.tp_groups:
+                m.tp_cpu_cache_store(ids, slot, page.page_index)
         self.entries[page.phash] = {
             "slot": slot,
             "prev_hash": page.prev_hash,
@@ -328,3 +292,18 @@ class CPUPageCache:
             m.tp_cpu_cache_fetch(ids, e["slot"], page_index)
         self.metrics["restores"] += 1
         return e
+
+    def close(self):
+        """
+        Drop the cache tensor references and return the pinned memory to the OS. Optional: the same happens
+        when the tier is garbage collected, this just makes it deterministic.
+        """
+        self.slot_views = []
+        if self.arena is not None:
+            self.arena.close()
+            self.arena = None
+        self.segments = []
+        self.entries = {}
+        self.free_slots.clear()
+        self.num_slots = 0
+        self.pagetable = None

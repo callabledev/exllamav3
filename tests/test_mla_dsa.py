@@ -10,7 +10,6 @@ from exllamav3.cache import CacheLayer_MLA_fp16, CacheLayer_MLA_quant
 from exllamav3.ext import exllamav3_ext as ext
 from exllamav3.constants import PAGE_SIZE
 from exllamav3.util.rope import RopeSettings, RopeStyle
-from exllamav3.modules.attention_fn.mla_triton import has_triton
 
 from test_mla import FakeConfig, rms_norm
 
@@ -28,7 +27,6 @@ from test_mla import FakeConfig, rms_norm
 #   - the cached path (paged indexer-key plane) against the cache-less path, chunked.
 
 device = "cuda:0"
-pytestmark = pytest.mark.skipif(not has_triton, reason = "requires Triton")
 
 
 def build_dsa(H = 8, hidden = 512, kv_lora = 512, nope = 128, rope_dim = 64, v_head = 128,
@@ -201,10 +199,14 @@ def test_dsa_selection(S):
     for b in range(bsz):
         for q_row in range(0, S, 17):
             k_eff = min(topk, q_row + 1)
-            ref_top = set(ref_scores[b, q_row].topk(k_eff).indices.tolist())
+            ref_row = ref_scores[b, q_row]
+            ref_top = set(ref_row.topk(k_eff).indices.tolist())
             got = set(i for i in indices[b, q_row].tolist() if i >= 0)
             assert len(got) == k_eff, f"row {q_row}: {len(got)} selected, expected {k_eff}"
-            overlap = len(ref_top & got)
+            # The ReLU in the index score makes exact ties (at 0) common at the k-th boundary, where
+            # any tie member is as valid as the reference's pick
+            kth = ref_row.topk(k_eff).values[-1].item()
+            overlap = len(ref_top & got) + sum(1 for i in got - ref_top if ref_row[i].item() == kth)
             assert overlap >= k_eff - max(2, k_eff // 16), \
                 f"row {q_row}: only {overlap}/{k_eff} of the reference selection"
 

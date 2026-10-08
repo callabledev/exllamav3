@@ -1,9 +1,24 @@
 #pragma once
 
+// The GEMM / multi-GEMM wrappers (slab loop, input Hadamard, grid barriers) and the shape table
+// (exl3_kernel_map.cuh) are shared; the backend supplies the tile inner: tensor-core MMA with cp.async
+// pipelines (CUDA) or WMMA on RDNA (rocm/quant)
 #include "exl3_kernel_map.cuh"
 #include "hadamard_inner.cuh"
-#include "exl3_gemm_inner.cuh"
+#if defined(USE_ROCM)
+    #include "../rocm/quant/exl3_gemm_inner_rdna.cuh"
+#else
+    #include "exl3_gemm_inner.cuh"
+#endif
 #include "exl3_devctx.cuh"
+
+// Whole-grid barrier. On ROCm the kernels are plain launches (EXL3_COOP_LAUNCH, coop_autotune.cuh) and sync
+// through a device counter; every block is resident (the grid is at most one block per multiprocessor)
+#if defined(USE_ROCM)
+    #define EXL3_GRID_SYNC() group_barrier(0, gridDim.x * gridDim.y * gridDim.z, locks + EXL3_GRID_BARRIER_OFFSET)
+#else
+    #define EXL3_GRID_SYNC() grid.sync()
+#endif
 
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
@@ -26,7 +41,7 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
                 0.088388347648f  // 1/sqrt(128)
             );
 
-        grid.sync();
+        EXL3_GRID_SYNC();
         A = A_had;
     }
 
@@ -37,16 +52,16 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
     while (size_m_ > 0)
     {
         exl3_gemm_kernel_inner
-        <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
-        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks, svh);
+        <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+        (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, size_n, locks, svh);
 
-        A_ += 16 * size_k;
-        if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
-        else                  C_ = (void*) (((half*) C_) + 16 * size_n);
-        size_m_ -= 16;
+        A_ += TILESIZE_M * size_k;
+        if constexpr (c_fp32) C_ = (void*) (((float*) C_) + TILESIZE_M * size_n);
+        else                  C_ = (void*) (((half*) C_) + TILESIZE_M * size_n);
+        size_m_ -= TILESIZE_M;
 
         if (size_m_ > 0 || svh)
-            grid.sync();
+            EXL3_GRID_SYNC();
     }
 
     // if (svh)
@@ -92,7 +107,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     int bszm = MAX(bszm_in, bszm_out);
     auto grid = cg::this_grid();
 
-    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+    #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)) || defined(USE_ROCM)
         int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
     #endif
 
@@ -138,10 +153,33 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             }
         }
         __threadfence();
-        grid.sync();
+        EXL3_GRID_SYNC();
         B_indices = v_indices;
         if (B_weights) B_weights = v_weights;
         bszm = bszm_sync;
+    }
+
+    // Sliced mode: the entries are equal-width column slices of fewer source matrices, so the
+    // input transform runs once per source (suh_list is per source, A_had holds one slab per
+    // source) with every block cooperating, and each slice then reads its source's slab
+    if (had_src_list)
+    {
+        int total_warps = size_m * size_k / 128;
+        int warps_grid = gridDim.x * gridDim.z * blockDim.x / 32;
+        int this_warp = threadIdx.x / 32 + blockDim.x / 32 * (blockIdx.x + gridDim.x * blockIdx.z);
+        for (; this_warp < num_had_src * total_warps; this_warp += warps_grid)
+        {
+            int src = this_warp / total_warps;
+            int w = this_warp - src * total_warps;
+            had_hf_r_128_inner<true, false>
+            (
+                A + w * 128,
+                A_had + src * size_m * size_k + w * 128,
+                suh_list[src] + (w * 128) % size_k,
+                0.088388347648f  // 1/sqrt(128)
+            );
+        }
+        EXL3_GRID_SYNC();
     }
 
     for (int i = 0; i < bszm; i += gridDim.z)
@@ -159,9 +197,9 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             }
         }
 
-        // Had and input scales
+        // Had and input scales (sliced mode: done once per source above)
 
-        if (B)
+        if (B && !had_src_list)
         {
             int total_warps = size_m * size_k / 128;
             int warps_grid = gridDim.x * blockDim.x / 32;
@@ -181,10 +219,10 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 );
         }
 
-        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+        #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)) || defined(USE_ROCM)
             group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
         #else
-            grid.sync();
+            EXL3_GRID_SYNC();
         #endif
 
         // Matmul. Per-matrix output width/pointer when the caller supplies the lists
@@ -192,8 +230,11 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         // resolved once per matrix, outside all inner loops
 
         int n_j = (size_n_list && mat_index >= 0) ? size_n_list[mat_index] : size_n;
+        // Column slices write into a wider row (their source matrix's full width)
+        int n_stride_j = (n_stride_list && mat_index >= 0) ? n_stride_list[mat_index] : n_j;
         int size_m_ = size_m;
-        half* A_ = A_had + j * size_m * size_k;
+        // Idle z-slots past bszm carry mat_index -1 and never touch A_; guard the table read anyway
+        half* A_ = A_had + ((had_src_list && mat_index >= 0) ? had_src_list[mat_index] : j) * size_m * size_k;
         void* C_;
         if (C_list && mat_index >= 0) C_ = C_list[mat_index];
         else if constexpr (c_fp32) C_ = (void*) (((float*) C) + j * size_m * size_n);
@@ -207,19 +248,19 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
                 int lock_offs = blockIdx.z * size_n / 128;
 
                 exl3_gemm_kernel_inner
-                <bits, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
-                (A_, B, C_, MIN(size_m_, 16), size_k, n_j, locks + lock_offs, nullptr);
+                <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, false>
+                (A_, B, C_, MIN(size_m_, TILESIZE_M), size_k, n_j, locks + lock_offs, nullptr, n_stride_j);
             }
 
-            A_ += 16 * size_k;
-            if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * n_j);
-            else                  C_ = (void*) (((half*) C_) + 16 * n_j);
-            size_m_ -= 16;
+            A_ += TILESIZE_M * size_k;
+            if constexpr (c_fp32) C_ = (void*) (((float*) C_) + TILESIZE_M * n_stride_j);
+            else                  C_ = (void*) (((half*) C_) + TILESIZE_M * n_stride_j);
+            size_m_ -= TILESIZE_M;
 
-            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)
+            #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ > 890)) || defined(USE_ROCM)
                 group_barrier(blockIdx.z, gridDim.x, barrier_counters_sense);
             #else
-                grid.sync();
+                EXL3_GRID_SYNC();
             #endif
         }
 
@@ -237,22 +278,26 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
 
             C_ = C_base;
 
+            int cols = n_j / 128;
             for(; this_warp < total_warps; this_warp += warps_grid)
             {
+                int row = this_warp / cols;
+                int col = this_warp - row * cols;
+                int offs = row * n_stride_j + col * 128;
                 if constexpr (c_fp32)
                     had_ff_r_128_inner<false, true>
                     (
-                        ((const float*) C_) + this_warp * 128,
-                        ((float*) C_) + this_warp * 128,
-                        svh + (this_warp * 128) % n_j,
+                        ((const float*) C_) + offs,
+                        ((float*) C_) + offs,
+                        svh + col * 128,
                         scale
                     );
                 else
                     had_hf_r_128_inner<false, true>
                     (
-                        ((const half*) C_) + this_warp * 128,
-                        ((half*) C_) + this_warp * 128,
-                        svh + (this_warp * 128) % n_j,
+                        ((const half*) C_) + offs,
+                        ((half*) C_) + offs,
+                        svh + col * 128,
                         scale
                     );
             }
@@ -260,7 +305,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     }
 
     if (B_weights)
-        grid.sync();
+        EXL3_GRID_SYNC();
 
     // Final reduction: each of the num_tokens groups of (bszm / num_tokens) contiguous slots is
     // summed into its own output row (row t for group t), instead of always collapsing into row
