@@ -6,6 +6,7 @@ from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
+from .linear import copy_lora_to_statics
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
@@ -396,7 +397,8 @@ class MLP(Module):
         bsz, q_len, _ = x.shape
         if (
             self.bc is not None and bsz == 1 and q_len == 1 and
-            x.dtype == torch.float16 and x.is_contiguous()
+            x.dtype == torch.float16 and x.is_contiguous() and
+            not any(m.lora_a_tensors for group in (self.ups, self.downs) for m in group)
         ):
             d = torch.empty((bsz, q_len, self.out_size), dtype = out_dtype or self.out_dtype, device = x.device)
             self.bc.run_bsz1(x, d)
@@ -726,6 +728,8 @@ class GatedMLP(Module):
 
         self.bc = None
         self.bsz1_pa_args = []
+        self.lora_statics = None    # enable_graph_lora: {name: (A, B)} the captured graphs read
+        self.lora_stage_ok = False  # sync_graph_lora: the statics hold exactly what is loaded
 
 
     @override
@@ -812,6 +816,8 @@ class GatedMLP(Module):
                     self.downs[0].inner.bc,
                     self.act_limit,
                 )
+                if self.lora_statics is not None:
+                    self.bind_lora()
 
 
     @override
@@ -823,11 +829,65 @@ class GatedMLP(Module):
             #     g_tensor_cache.drop(*arg)
             self.bc = None
             self.bsz1_pa_args = []
+        self.lora_statics = None
+        self.lora_stage_ok = False
 
         for i in range(self.num_slices):
             if self.multi_gu[i] is not None:
                 self.multi_gu[i].unload()
                 self.multi_gu[i] = None
+
+
+    def enable_graph_lora(self, rank: int):
+        """
+        Give the graphed decode path a LoRA stage of up to this rank, or return False where it has none (the
+        python path then runs whenever an adapter is loaded). Call once, before any decode has captured a
+        graph; adapter weights then go in with sync_graph_lora() without recapturing, so a swap is a copy.
+        Zero weights (no adapter) cost the same as a loaded adapter.
+        """
+        if self.bc is None or self.num_slices != 1 or not hasattr(self.bc, "set_lora"):
+            return False
+        g, u, d = self.gates[0], self.ups[0], self.downs[0]
+        if g.in_features != self.hidden_size or d.out_features != self.hidden_size:
+            return False
+        dev = self.device
+        def z(*shape):
+            return torch.zeros(shape, dtype = torch.half, device = dev)
+        self.lora_statics = {
+            "gate": (z(g.in_features, rank), z(rank, g.out_features)),
+            "up": (z(u.in_features, rank), z(rank, u.out_features)),
+            "down": (z(d.in_features, rank), z(rank, d.out_features)),
+        }
+        self.bind_lora()
+        return True
+
+
+    def bind_lora(self):
+        """Hand the statics to the current BC object (also after pin_linears rebuilt it)"""
+        g, u, d = self.gates[0], self.ups[0], self.downs[0]
+        rank = self.lora_statics["gate"][0].shape[1]
+        def scratch(shape, tag):
+            return g_tensor_cache.get(self.device, shape, torch.half, tag)
+        self.bc.set_lora(
+            scratch((MAX_BSZN, g.in_features), "lora_mlp_xs"),
+            scratch((MAX_BSZN, rank), "lora_mlp_t"),
+            *self.lora_statics["gate"], scratch((MAX_BSZN, g.out_features), "lora_mlp_gd"),
+            *self.lora_statics["up"], scratch((MAX_BSZN, u.out_features), "lora_mlp_ud"),
+            *self.lora_statics["down"], scratch((MAX_BSZN, d.out_features), "lora_mlp_dd"),
+        )
+
+
+    def sync_graph_lora(self):
+        """Copy the loaded adapter's weights from the Linears into the graph's statics"""
+        if self.lora_statics is not None:
+            self.lora_stage_ok = all([
+                copy_lora_to_statics(lin, *self.lora_statics[name])
+                for name, lin in (("gate", self.gates[0]), ("up", self.ups[0]), ("down", self.downs[0]))
+            ])
+
+
+    def has_lora(self) -> bool:
+        return any(m.lora_a_tensors for group in (self.gates, self.ups, self.downs) for m in group)
 
 
     @override
@@ -865,12 +925,14 @@ class GatedMLP(Module):
 
             for s in r:
 
-                if self.bc is not None and bsz * q_len <= MAX_BSZN:
+                # With a loaded adapter the graph needs a LoRA stage holding it, or it would run without
+                if self.bc is not None and bsz * q_len <= MAX_BSZN and (self.lora_stage_ok or not self.has_lora()):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))
 
-                elif self.multi_gu[s] is None or bsz * q_len > 32:
+                # The fused gate+up path has no LoRA stage; Linear.forward does
+                elif self.multi_gu[s] is None or bsz * q_len > 32 or self.gates[s].lora_a_tensors or self.ups[s].lora_a_tensors:
                     g = self.gates[s].forward(x, params)
                     u = self.ups[s].forward(x, params)
                     if "capture_sens" in params:

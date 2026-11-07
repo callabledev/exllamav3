@@ -31,6 +31,25 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return w.view(blocks.shape[0], -1).half()
 
 
+def copy_lora_to_statics(linear, a_static: torch.Tensor, b_static: torch.Tensor) -> bool:
+    """
+    Put a Linear's loaded adapter into graph statics of a possibly larger rank, zeros if it has none. False if the
+    stage can't represent what is loaded (several adapters, or a rank above the statics'): the python path must run.
+    """
+    a_static.zero_()
+    b_static.zero_()
+    if len(linear.lora_a_tensors) > 1:
+        return False
+    for lora, a in linear.lora_a_tensors.items():
+        b = linear.lora_b_tensors[lora]
+        r = a.shape[1]
+        if r > a_static.shape[1]:
+            return False
+        a_static[:, :r].copy_(a)
+        b_static[:r, :].copy_(b)
+    return True
+
+
 class Linear(Module):
 
     def __init__(
