@@ -48,6 +48,35 @@ class Model(Model_TPMixin, Model_LSMixin):
         self.check_compat()
 
 
+    def enable_graph_lora(self, rank: int) -> dict:
+        """
+        Give graphed decode paths a LoRA stage of up to this rank, so loaded adapters don't push decode onto the
+        python path. Call once after the model loads, before any decode, with or without an adapter loaded.
+        Modules where it can't be placed (including those whose graphs a decode already captured) return False
+        and run on the python path while an adapter is loaded. Returns counts, for logging.
+        """
+        counts = {"stage": 0, "python": 0}
+        for module in self:
+            enable = getattr(module, "enable_graph_lora", None)
+            if enable is None:
+                continue
+            counts["stage" if enable(rank) else "python"] += 1
+        self.sync_graph_lora()
+        return counts
+
+
+    def sync_graph_lora(self):
+        """
+        Copy the loaded adapters into the graph stages now. Optional: a stage notices any change to the Linears'
+        adapters and copies them in at its next decode step; LoRA calls this on load and unload, so that step
+        doesn't pay for the copy.
+        """
+        for module in self:
+            sync = getattr(module, "sync_graph_lora", None)
+            if sync is not None:
+                sync()
+
+
     def __iter__(self):
         for module in self.modules:
             yield from module

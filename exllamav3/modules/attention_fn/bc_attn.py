@@ -285,6 +285,14 @@ class BCAttn:
                 pool_plane = qsa_layer.pooled.view(-1, idx.head_dim),
             )
         self.slot_widths = {}
+        self.lora = False
+        if getattr(module, "lora_statics", None) is not None:
+            self.bind_lora()
+
+    def bind_lora(self):
+        """Give the graph the module's LoRA stage. Before this instance configures any slot."""
+        self.bc.set_lora(*self.module.lora_bc_args())
+        self.lora = True
 
     def _pointer_range_32(self) -> bool:
         """Whether the split kernels may assume 32-bit buffer offsets (AMD buffer loads): every
@@ -407,10 +415,10 @@ class BCAttn:
 
         # Padded hidden dim: zero-padded input staging and padded o_proj output. The pad columns
         # of xp are zeroed here and never written afterwards (the graph copies only the exact
-        # hidden width into it). An fp16 gate also stages the input (static operand for the
-        # captured cublas node), without the padded output
+        # hidden width into it). An fp16 gate or LoRA stage also stages the input (static operand
+        # for the captured cublas nodes), without the padded output
         xp, yp = None, None
-        if self.hidden_padded != self.hidden_size or self.g_weight is not None:
+        if self.hidden_padded != self.hidden_size or self.g_weight is not None or self.lora:
             xp = g_tensor_cache.get(dev, (R, self.hidden_padded), torch.half, "bca_xp")
             xp.zero_()
         if self.hidden_padded != self.hidden_size:

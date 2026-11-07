@@ -50,6 +50,26 @@ struct BC_GatedMLP
     std::vector<at::Tensor> guh_cache;
     std::vector<at::Tensor> gu_cache;
 
+    // Optional LoRA stage, set once before any graph is captured. Every tensor here is a static whose
+    // address is baked into the graphs: swapping an adapter copies its weights into them, no recapture.
+    // Each projection adds (input @ A @ B) to its output, like Linear.apply_lora on the python path.
+    bool lora_enabled = false;
+    at::Tensor lora_xs;                                 // (MAX_BSZN, K) staged x: cublas nodes have no patchable sites
+    at::Tensor lora_t;                                  // (MAX_BSZN, r) scratch
+    at::Tensor lora_gate_a, lora_gate_b, lora_gate_d;   // (K, r), (r, N), (MAX_BSZN, N)
+    at::Tensor lora_up_a, lora_up_b, lora_up_d;
+    at::Tensor lora_down_a, lora_down_b, lora_down_d;
+
+    bool captured() const;      // any graph captured: too late for set_lora
+
+    void set_lora
+    (
+        at::Tensor xs, at::Tensor t,
+        at::Tensor gate_a, at::Tensor gate_b, at::Tensor gate_d,
+        at::Tensor up_a, at::Tensor up_b, at::Tensor up_d,
+        at::Tensor down_a, at::Tensor down_b, at::Tensor down_d
+    );
+
     BC_GatedMLP
     (
         at::Tensor _guh,

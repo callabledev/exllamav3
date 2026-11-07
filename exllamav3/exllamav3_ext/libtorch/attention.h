@@ -254,6 +254,24 @@ struct BC_Attention
         c10::optional<at::Tensor> sinks
     );
 
+    // Optional LoRA stage (see BC_GatedMLP::set_lora), set before any slot captures. Forces input
+    // staging: cublas nodes have no patchable sites. Weights are statics: a swap copies into them
+    bool lora_enabled = false;
+    at::Tensor lora_t;                              // (MAX_R, r) scratch
+    at::Tensor lora_q_a, lora_q_b, lora_q_d;        // (K, r), (r, N), (MAX_R, N)
+    at::Tensor lora_k_a, lora_k_b, lora_k_d;
+    at::Tensor lora_v_a, lora_v_b, lora_v_d;
+    at::Tensor lora_o_a, lora_o_b, lora_o_d;
+
+    void set_lora
+    (
+        at::Tensor t,
+        at::Tensor q_a, at::Tensor q_b, at::Tensor q_d,
+        at::Tensor k_a, at::Tensor k_b, at::Tensor k_d,
+        at::Tensor v_a, at::Tensor v_b, at::Tensor v_d,
+        at::Tensor o_a, at::Tensor o_b, at::Tensor o_d
+    );
+
     void set_qsa
     (
         std::shared_ptr<BC_LinearEXL3> qk_proj,

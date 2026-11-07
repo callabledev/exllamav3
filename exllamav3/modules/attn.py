@@ -12,6 +12,7 @@ from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
+from .linear import GraphLoraStage
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
@@ -147,7 +148,7 @@ def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
             raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
 
-class Attention(Module):
+class Attention(Module, GraphLoraStage):
 
     def __init__(
         self,
@@ -242,6 +243,7 @@ class Attention(Module):
         self.tp_reduce = False
         self.dispatch_cache = {}
         self.bc_attn = {}
+        self.reset_graph_lora()
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
@@ -580,6 +582,7 @@ class Attention(Module):
         super().unload()
 
         self.bc_attn = {}
+        self.reset_graph_lora()
 
         for cl in self.cache_layers:
             cl.free()
@@ -637,14 +640,57 @@ class Attention(Module):
         return to2(x, out_dtype, self.out_dtype)
 
 
+    def has_lora(self) -> bool:
+        return any(p is not None and p.lora_a_tensors for p in
+                   (self.q_proj, getattr(self, "k_proj", None), getattr(self, "v_proj", None), self.g_proj, self.o_proj))
+
+
+    def enable_graph_lora(self, rank: int) -> bool:
+        """
+        Give the graphed decode path a LoRA stage of up to this rank, or return False where it has none (the
+        python path then runs whenever an adapter is loaded). Call before any decode has captured a slot;
+        adapters then reach the stage as copies, with no recapture.
+        """
+        if (
+            self.q_proj is None or self.o_proj is None or
+            getattr(self, "k_proj", None) is None or getattr(self, "v_proj", None) is None or
+            self.use_k_as_v or self.g_proj is not None or getattr(self, "interleaved_gate", False) or
+            self.qsa_indexer is not None or
+            not hasattr(ext.BC_Attention, "set_lora") or
+            self.q_proj.in_features != self.hidden_size or self.o_proj.out_features != self.hidden_size or
+            any(b and b.slot_widths for b in self.bc_attn.values())
+        ):
+            return False
+        self.lora_statics = self.make_lora_statics(rank)
+        for b in self.bc_attn.values():
+            if b:
+                b.bind_lora()
+        return True
+
+
+    def lora_targets(self) -> tuple:
+        return ("q", self.q_proj), ("k", self.k_proj), ("v", self.v_proj), ("o", self.o_proj)
+
+
+    def lora_bc_args(self) -> list:
+        from .attention_fn.bc_attn import MAX_R
+        rank = self.lora_statics["q"][0].shape[1]
+        args = [g_tensor_cache.get(self.device, (MAX_R, rank), torch.half, "lora_attn_t")]
+        for name, p in self.lora_targets():
+            args += [*self.lora_statics[name], g_tensor_cache.get(self.device, (MAX_R, p.out_features), torch.half, f"lora_attn_{name}d")]
+        return args
+
+
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
         bsz, q_len, dim = x.shape
+        # The fused projections have no LoRA stage; Linear.forward does
+        has_lora = self.has_lora()
 
-        if self.multi_qkv is not None and bsz * q_len <= 32:
+        if self.multi_qkv is not None and bsz * q_len <= 32 and not has_lora:
             q, k, v, g = self.project_qkv_sliced(x, bsz, q_len)
             return self.finish_qkv(q, k, v, g, bsz, q_len, params)
 
-        if self.multi_qg is None or bsz * q_len > 32:
+        if self.multi_qg is None or bsz * q_len > 32 or has_lora:
             q = self.q_proj.forward(x, params)
             if self.interleaved_gate:
                 if self.head_dim % 8 == 0 and q.dtype == torch.half:
@@ -692,7 +738,7 @@ class Attention(Module):
             q = qg[0].view(bsz, q_len, self.num_q_heads * self.head_dim)
             g = qg[1].view(bsz, q_len, self.num_q_heads * self.head_dim)
 
-        if self.multi_kv is None or bsz * q_len > 32:
+        if self.multi_kv is None or bsz * q_len > 32 or has_lora:
             k = self.k_proj.forward(x, params)
             v = self.v_proj.forward(x, params) if not self.use_k_as_v else k
 
@@ -1124,9 +1170,11 @@ class Attention(Module):
 
         # Graph-captured C++ path for the whole decode attention block (causality is baked
         # into the slot kernels, so non-causal callers like the DFlash draft graph too)
+        # With a loaded adapter the graph needs a LoRA stage holding it, or it would run without
         if (
             _bc_attn_enable and non_causal_spans is None and
-            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen
+            bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
+            (self.lora_stage_current() or not self.has_lora())
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
                                   host_seqlens = qsa_seqlens_cpu)

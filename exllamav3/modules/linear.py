@@ -31,6 +31,97 @@ def _mxfp4_dequant(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     return w.view(blocks.shape[0], -1).half()
 
 
+_lora_generation = 0
+
+
+def _counting(name: str):
+    method = getattr(dict, name)
+    def counted(self, *args, **kwargs):
+        global _lora_generation
+        _lora_generation += 1
+        return method(self, *args, **kwargs)
+    return counted
+
+
+class LoraTensors(dict):
+    """
+    A Linear's adapter tensors, {lora: A} or {lora: B}. Every change counts in _lora_generation, so a graph's LoRA stage
+    notices an adapter that came or went since it last copied them in, whoever changed the dict
+    """
+    __setitem__ = _counting("__setitem__")
+    __delitem__ = _counting("__delitem__")
+    __ior__ = _counting("__ior__")
+    pop = _counting("pop")
+    popitem = _counting("popitem")
+    clear = _counting("clear")
+    update = _counting("update")
+    setdefault = _counting("setdefault")
+
+
+def copy_lora_to_statics(linear, a_static: torch.Tensor, b_static: torch.Tensor) -> bool:
+    """
+    Put a Linear's loaded adapter into graph statics of a possibly larger rank, zeros if it has none. False if the
+    stage can't represent what is loaded (several adapters, or a rank above the statics'): the python path must run.
+    An A without its B adds nothing, as in Linear.apply_lora.
+    """
+    a_static.zero_()
+    b_static.zero_()
+    if len(linear.lora_a_tensors) > 1:
+        return False
+    for lora, a in linear.lora_a_tensors.items():
+        b = linear.lora_b_tensors.get(lora)
+        if b is None:
+            continue
+        r = a.shape[1]
+        if r > a_static.shape[1]:
+            return False
+        a_static[:, :r].copy_(a)
+        b_static[:r, :].copy_(b)
+    return True
+
+
+class GraphLoraStage:
+    """
+    For modules whose decode graphs can carry a LoRA stage (Attention, GatedMLP): fp16 statics of a fixed rank, read by
+    the captured graphs, that mirror the adapter loaded on lora_targets(). Swapping adapters copies into them.
+    """
+
+    def lora_targets(self) -> tuple:
+        """((name, Linear), ...) the stage applies LoRA to"""
+        raise NotImplementedError()
+
+
+    def reset_graph_lora(self):
+        self.lora_statics = None    # enable_graph_lora: {name: (A, B)} the captured graphs read
+        self.lora_stage_ok = False  # the statics hold exactly what is loaded
+        self.lora_synced = -1       # _lora_generation when they were last copied in
+
+
+    def make_lora_statics(self, rank: int) -> dict:
+        def z(*shape):
+            return torch.zeros(shape, dtype = torch.half, device = self.device)
+        return {name: (z(p.in_features, rank), z(rank, p.out_features)) for name, p in self.lora_targets()}
+
+
+    def sync_graph_lora(self):
+        """Copy the loaded adapter's weights from the Linears into the graph's statics"""
+        if self.lora_statics is not None:
+            generation = _lora_generation
+            self.lora_stage_ok = all([
+                copy_lora_to_statics(p, *self.lora_statics[name]) for name, p in self.lora_targets()
+            ])
+            self.lora_synced = generation
+
+
+    def lora_stage_current(self) -> bool:
+        """Whether the stage holds exactly the loaded adapter, copying it in first if adapters changed since"""
+        if self.lora_statics is None:
+            return False
+        if self.lora_synced != _lora_generation:
+            self.sync_graph_lora()
+        return self.lora_stage_ok
+
+
 class Linear(Module):
 
     def __init__(
@@ -101,8 +192,8 @@ class Linear(Module):
         self.ftranspose_after_load = ftranspose_after_load
         self.select_hq_bits = select_hq_bits
         self.qgroup = qgroup or key
-        self.lora_a_tensors = {}
-        self.lora_b_tensors = {}
+        self.lora_a_tensors = LoraTensors()
+        self.lora_b_tensors = LoraTensors()
 
         # in_features_unpadded < in_features is handled at runtime: inputs narrower than the
         # (padded) weight are zero-extended in forward(). allow_input_padding marks layers whose

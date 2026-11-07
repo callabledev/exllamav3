@@ -13,6 +13,12 @@ Usage::
     # Unload to revert to base model
     lora.unload()
 
+The graphed decode paths have no LoRA of their own. With an adapter loaded, Attention, GatedMLP and MLP take the python
+path, unless ``model.enable_graph_lora(rank)`` was called after the model loaded, before any decode, which keeps the
+Attention and GatedMLP graphs at the cost of a stage per projection. Adapters of up to that rank, one at a time, then
+reach the stages by copy, whoever puts them on the Linears. The other graphed decode paths (MLA, DSA, gated delta net,
+Mamba2, block-sparse MoE, DSV4) don't check: adapters on their projections reach prefill only.
+
 Compatible with adapters trained via PEFT/Unsloth on the full-precision
 base model. LoRA weights are applied on top of the dequantized output
 of each target linear layer.
@@ -78,6 +84,7 @@ class LoRA:
             weights_path: str,
             lora_scaling: float = 1.0,
     ):
+        self.model = model
         self.target_modules = {}
         self.name = os.path.basename(os.path.dirname(config_path))
 
@@ -178,6 +185,7 @@ class LoRA:
             self.target_modules[module_key] = target
             loaded += 1
 
+        model.sync_graph_lora()
         print(
             f" -- LoRA '{self.name}': loaded {loaded} tensors "
             f"(r={self.lora_r}, alpha={self.lora_alpha:.0f}, "
@@ -219,3 +227,4 @@ class LoRA:
             target.lora_b_tensors.pop(self, None)
 
         self.target_modules = {}
+        self.model.sync_graph_lora()

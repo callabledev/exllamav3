@@ -159,6 +159,26 @@ BC_Attention::BC_Attention
     }
 }
 
+void BC_Attention::set_lora
+(
+    at::Tensor t,
+    at::Tensor q_a, at::Tensor q_b, at::Tensor q_d,
+    at::Tensor k_a, at::Tensor k_b, at::Tensor k_d,
+    at::Tensor v_a, at::Tensor v_b, at::Tensor v_d,
+    at::Tensor o_a, at::Tensor o_b, at::Tensor o_d
+)
+{
+    // A slot configured without the stage has no input staging, and its graph no sites for the stage's params
+    for (const Slot& s : slots)
+        TORCH_CHECK(!s.configured, "BC_Attention::set_lora: slots are already configured");
+    lora_t = std::move(t);
+    lora_q_a = std::move(q_a); lora_q_b = std::move(q_b); lora_q_d = std::move(q_d);
+    lora_k_a = std::move(k_a); lora_k_b = std::move(k_b); lora_k_d = std::move(k_d);
+    lora_v_a = std::move(v_a); lora_v_b = std::move(v_b); lora_v_d = std::move(v_d);
+    lora_o_a = std::move(o_a); lora_o_b = std::move(o_b); lora_o_d = std::move(o_d);
+    lora_enabled = true;
+}
+
 void BC_Attention::set_qsa
 (
     std::shared_ptr<BC_LinearEXL3> _qk_proj,
@@ -233,12 +253,12 @@ void BC_Attention::configure_slot
     s.block_n = block_n;
     s.splits_cap = splits_cap;
 
-    if (hidden_size_padded != hidden_size || g_weight)
+    if (hidden_size_padded != hidden_size || g_weight || lora_enabled)
     {
-        // Zero-padded staging for the projection input (also required for an fp16 gate: the
-        // captured cublas node reads a static input). The pad columns of xp are zeroed
+        // Zero-padded staging for the projection input (also required for an fp16 gate or a LoRA
+        // stage: the captured cublas nodes read a static input). The pad columns of xp are zeroed
         // python-side at configure and never written after
-        TORCH_CHECK(xp, "BC_Attention: padded hidden size or fp16 gate requires the xp static");
+        TORCH_CHECK(xp, "BC_Attention: padded hidden size, fp16 gate or LoRA requires the xp static");
         s.xp = xp.value();
         TORCH_CHECK(s.xp.is_contiguous(), "BC_Attention: statics must be contiguous");
         TORCH_CHECK(s.xp.size(0) >= R && s.xp.size(1) == hidden_size_padded, "BC_Attention: bad xp shape");
@@ -428,7 +448,7 @@ void BC_Attention::run_gr
     // works at the padded width (the projections' actual K). An fp16 gate also stages: the
     // gate gemm is a captured cublas node with no patchable sites, so its input must be static
     const int hs = hidden_size_padded;
-    if (hs != hidden_size || g_weight)
+    if (hs != hidden_size || g_weight || lora_enabled)
     {
         at::Tensor xp2 = s.xp.narrow(0, 0, R);
         copy2d_gr(x2, xp2, graph);
@@ -542,6 +562,27 @@ void BC_Attention::run_gr
         exl3_gemm_gr(x2, v_proj->trellis, v2, v_proj->suh, xh_k, v_proj->svh, -1, v_proj->mcg, v_proj->mul1, 0, graph);
         if (v_proj->bias)
             add_gr(v2, v_proj->bias.value(), v2, graph);
+    }
+
+    // LoRA on Q, K, V, ahead of norm + RoPE: output += x @ A @ B, as Linear.apply_lora does
+    at::Tensor lora_t_r;
+    if (lora_enabled)
+    {
+        lora_t_r = lora_t.narrow(0, 0, R);
+        at::Tensor qd = lora_q_d.narrow(0, 0, R);
+        at::Tensor kd = lora_k_d.narrow(0, 0, R);
+        at::Tensor vd = lora_v_d.narrow(0, 0, R);
+        at::Tensor k2 = kv2.select(0, 0);
+        at::Tensor v2 = kv2.select(0, 1);
+        hgemm_gr(x2, lora_q_a, lora_t_r, graph);
+        hgemm_gr(lora_t_r, lora_q_b, qd, graph);
+        add_gr(s.q2, qd, s.q2, graph);
+        hgemm_gr(x2, lora_k_a, lora_t_r, graph);
+        hgemm_gr(lora_t_r, lora_k_b, kd, graph);
+        add_gr(k2, kd, k2, graph);
+        hgemm_gr(x2, lora_v_a, lora_t_r, graph);
+        hgemm_gr(lora_t_r, lora_v_b, vd, graph);
+        add_gr(v2, vd, v2, graph);
     }
 
     if (v_norm && !use_k_as_v)
@@ -843,6 +884,13 @@ void BC_Attention::run_gr
     exl3_gemm_gr(s.o2, o_proj->trellis, c2, o_proj->suh, xh_o, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
     if (o_proj->bias)
         add_gr(c2, o_proj->bias.value(), c2, graph);
+    if (lora_enabled)
+    {
+        at::Tensor od = lora_o_d.narrow(0, 0, R);
+        hgemm_gr(s.o2, lora_o_a, lora_t_r, graph);
+        hgemm_gr(lora_t_r, lora_o_b, od, graph);
+        add_gr(c2, od, c2, graph);
+    }
     if (hs != hidden_size)
         copy2d_gr(c2, y2, graph);
 }
@@ -900,7 +948,7 @@ void BC_Attention::run
     // Padded hidden dim or fp16 gate: x feeds the staging copy at the head of the graph and the
     // projections read the (static) buffer; otherwise the projections read x directly
     bool padded = hidden_size_padded != hidden_size;
-    bool staged = padded || g_weight.has_value();
+    bool staged = padded || g_weight.has_value() || lora_enabled;
     void* xptr = staged ? s.xp.data_ptr() : (void*) x.data_ptr();
     if (staged)
         params.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
@@ -1016,6 +1064,11 @@ void BC_Attention::run
     void* yptr = padded ? s.yp.data_ptr() : (void*) y.data_ptr();
     params.emplace_back(GP_gemm_C, yptr);
     if (o_proj->bias)
+    {
+        params.emplace_back(GP_add_x, yptr);
+        params.emplace_back(GP_add_z, yptr);
+    }
+    if (lora_enabled)
     {
         params.emplace_back(GP_add_x, yptr);
         params.emplace_back(GP_add_z, yptr);
