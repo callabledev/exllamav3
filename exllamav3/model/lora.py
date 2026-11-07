@@ -14,8 +14,9 @@ Usage::
     lora.unload()
 
 The graphed decode paths have no LoRA of their own: with an adapter loaded a module takes the python path, unless
-``model.enable_graph_lora(rank)`` was called after load, before any decode, which keeps the graphs at the cost of a
-stage per projection (Attention and GatedMLP). Custom loaders call ``model.sync_graph_lora()`` when done.
+``model.enable_graph_lora(rank)`` was called after the model loaded, before any decode, which keeps the graphs at the
+cost of a stage per projection (Attention and GatedMLP). Adapters of up to that rank, one at a time, then reach the
+stages by copy, whoever puts them on the Linears.
 
 Compatible with adapters trained via PEFT/Unsloth on the full-precision
 base model. LoRA weights are applied on top of the dequantized output

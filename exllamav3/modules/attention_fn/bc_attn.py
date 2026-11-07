@@ -290,8 +290,7 @@ class BCAttn:
             self.bind_lora()
 
     def bind_lora(self):
-        """Give the graph the module's LoRA stage. Before this instance captures any slot."""
-        assert not self.slot_widths, "BC_Attention: LoRA stage must be set before slots are configured"
+        """Give the graph the module's LoRA stage. Before this instance configures any slot."""
         self.bc.set_lora(*self.module.lora_bc_args())
         self.lora = True
 

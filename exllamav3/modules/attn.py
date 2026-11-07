@@ -12,7 +12,7 @@ from ..util.backend import QKV_SLICE
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 import os
-from .linear import copy_lora_to_statics
+from .linear import GraphLoraStage
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
 # Sliced Q/K/V(/G) projection bundle at decode (one mgemm over equal-width column slices);
@@ -148,7 +148,7 @@ def prepare_for_attn(input_ids: torch.Tensor, params: dict) -> torch.Tensor:
             raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
 
-class Attention(Module):
+class Attention(Module, GraphLoraStage):
 
     def __init__(
         self,
@@ -243,8 +243,7 @@ class Attention(Module):
         self.tp_reduce = False
         self.dispatch_cache = {}
         self.bc_attn = {}
-        self.lora_statics = None    # enable_graph_lora: {name: (A, B)} the captured graphs read
-        self.lora_stage_ok = False  # sync_graph_lora: the statics hold exactly what is loaded
+        self.reset_graph_lora()
 
         self.q_norm_tensor = None
         self.k_norm_tensor = None
@@ -583,8 +582,7 @@ class Attention(Module):
         super().unload()
 
         self.bc_attn = {}
-        self.lora_statics = None
-        self.lora_stage_ok = False
+        self.reset_graph_lora()
 
         for cl in self.cache_layers:
             cl.free()
@@ -651,7 +649,7 @@ class Attention(Module):
         """
         Give the graphed decode path a LoRA stage of up to this rank, or return False where it has none (the
         python path then runs whenever an adapter is loaded). Call before any decode has captured a slot;
-        adapter weights then go in with sync_graph_lora() without recapturing, so a swap is a copy.
+        adapters then reach the stage as copies, with no recapture.
         """
         if (
             self.q_proj is None or self.o_proj is None or
@@ -663,34 +661,24 @@ class Attention(Module):
             any(b and b.slot_widths for b in self.bc_attn.values())
         ):
             return False
-        def z(*shape):
-            return torch.zeros(shape, dtype = torch.half, device = self.device)
-        self.lora_statics = {
-            name: (z(p.in_features, rank), z(rank, p.out_features))
-            for name, p in (("q", self.q_proj), ("k", self.k_proj), ("v", self.v_proj), ("o", self.o_proj))
-        }
+        self.lora_statics = self.make_lora_statics(rank)
         for b in self.bc_attn.values():
             if b:
                 b.bind_lora()
         return True
 
 
+    def lora_targets(self) -> tuple:
+        return ("q", self.q_proj), ("k", self.k_proj), ("v", self.v_proj), ("o", self.o_proj)
+
+
     def lora_bc_args(self) -> list:
         from .attention_fn.bc_attn import MAX_R
         rank = self.lora_statics["q"][0].shape[1]
         args = [g_tensor_cache.get(self.device, (MAX_R, rank), torch.half, "lora_attn_t")]
-        for name, p in (("q", self.q_proj), ("k", self.k_proj), ("v", self.v_proj), ("o", self.o_proj)):
+        for name, p in self.lora_targets():
             args += [*self.lora_statics[name], g_tensor_cache.get(self.device, (MAX_R, p.out_features), torch.half, f"lora_attn_{name}d")]
         return args
-
-
-    def sync_graph_lora(self):
-        """Copy the loaded adapter's weights from the Linears into the graph's statics"""
-        if self.lora_statics is not None:
-            self.lora_stage_ok = all([
-                copy_lora_to_statics(p, *self.lora_statics[name])
-                for name, p in (("q", self.q_proj), ("k", self.k_proj), ("v", self.v_proj), ("o", self.o_proj))
-            ])
 
 
     def project_qkv(self, x: torch.Tensor, params: dict) -> tuple:
@@ -1186,7 +1174,7 @@ class Attention(Module):
         if (
             _bc_attn_enable and non_causal_spans is None and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
-            (self.lora_stage_ok or not self.has_lora())
+            (self.lora_stage_current() or not self.has_lora())
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
                                   host_seqlens = qsa_seqlens_cpu)

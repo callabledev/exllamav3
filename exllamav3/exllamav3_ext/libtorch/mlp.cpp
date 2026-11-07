@@ -11,6 +11,13 @@
 
 using namespace torch::indexing;
 
+bool BC_GatedMLP::captured() const
+{
+    for (int i = 0; i < MAX_BSZN; ++i)
+        if (graph_bszN[i].ready) return true;
+    return false;
+}
+
 void BC_GatedMLP::set_lora
 (
     at::Tensor xs, at::Tensor t,
@@ -19,8 +26,7 @@ void BC_GatedMLP::set_lora
     at::Tensor down_a, at::Tensor down_b, at::Tensor down_d
 )
 {
-    for (int i = 0; i < MAX_BSZN; ++i)
-        TORCH_CHECK(!graph_bszN[i].ready, "set_lora: graphs are already captured");
+    TORCH_CHECK(!captured(), "BC_GatedMLP::set_lora: graphs are already captured");
     lora_xs = std::move(xs);
     lora_t = std::move(t);
     lora_gate_a = std::move(gate_a); lora_gate_b = std::move(gate_b); lora_gate_d = std::move(gate_d);

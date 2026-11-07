@@ -6,7 +6,7 @@ from torch import nn
 from ..model.config import Config
 from ..util.tensor import to2
 from . import Module, Linear
-from .linear import copy_lora_to_statics
+from .linear import GraphLoraStage
 from ..ext import exllamav3_ext as ext
 from ..constants import MAX_MLP_INTERMEDIATE
 from ..model.model_tp_alloc import TPAllocation
@@ -557,7 +557,7 @@ class MLP(Module):
         return module
 
 
-class GatedMLP(Module):
+class GatedMLP(Module, GraphLoraStage):
 
     def __init__(
         self,
@@ -728,8 +728,7 @@ class GatedMLP(Module):
 
         self.bc = None
         self.bsz1_pa_args = []
-        self.lora_statics = None    # enable_graph_lora: {name: (A, B)} the captured graphs read
-        self.lora_stage_ok = False  # sync_graph_lora: the statics hold exactly what is loaded
+        self.reset_graph_lora()
 
 
     @override
@@ -829,8 +828,7 @@ class GatedMLP(Module):
             #     g_tensor_cache.drop(*arg)
             self.bc = None
             self.bsz1_pa_args = []
-        self.lora_statics = None
-        self.lora_stage_ok = False
+        self.reset_graph_lora()
 
         for i in range(self.num_slices):
             if self.multi_gu[i] is not None:
@@ -841,25 +839,22 @@ class GatedMLP(Module):
     def enable_graph_lora(self, rank: int):
         """
         Give the graphed decode path a LoRA stage of up to this rank, or return False where it has none (the
-        python path then runs whenever an adapter is loaded). Call once, before any decode has captured a
-        graph; adapter weights then go in with sync_graph_lora() without recapturing, so a swap is a copy.
-        Zero weights (no adapter) cost the same as a loaded adapter.
+        python path then runs whenever an adapter is loaded). Call before any decode has captured a graph;
+        adapters then reach the stage as copies, with no recapture. Zero weights (no adapter) cost the same
+        as a loaded adapter.
         """
-        if self.bc is None or self.num_slices != 1 or not hasattr(self.bc, "set_lora"):
+        if self.bc is None or self.num_slices != 1 or not hasattr(self.bc, "set_lora") or self.bc.captured():
             return False
-        g, u, d = self.gates[0], self.ups[0], self.downs[0]
+        g, d = self.gates[0], self.downs[0]
         if g.in_features != self.hidden_size or d.out_features != self.hidden_size:
             return False
-        dev = self.device
-        def z(*shape):
-            return torch.zeros(shape, dtype = torch.half, device = dev)
-        self.lora_statics = {
-            "gate": (z(g.in_features, rank), z(rank, g.out_features)),
-            "up": (z(u.in_features, rank), z(rank, u.out_features)),
-            "down": (z(d.in_features, rank), z(rank, d.out_features)),
-        }
+        self.lora_statics = self.make_lora_statics(rank)
         self.bind_lora()
         return True
+
+
+    def lora_targets(self) -> tuple:
+        return ("gate", self.gates[0]), ("up", self.ups[0]), ("down", self.downs[0])
 
 
     def bind_lora(self):
@@ -875,15 +870,6 @@ class GatedMLP(Module):
             *self.lora_statics["up"], scratch((MAX_BSZN, u.out_features), "lora_mlp_ud"),
             *self.lora_statics["down"], scratch((MAX_BSZN, d.out_features), "lora_mlp_dd"),
         )
-
-
-    def sync_graph_lora(self):
-        """Copy the loaded adapter's weights from the Linears into the graph's statics"""
-        if self.lora_statics is not None:
-            self.lora_stage_ok = all([
-                copy_lora_to_statics(lin, *self.lora_statics[name])
-                for name, lin in (("gate", self.gates[0]), ("up", self.ups[0]), ("down", self.downs[0]))
-            ])
 
 
     def has_lora(self) -> bool:
@@ -926,7 +912,7 @@ class GatedMLP(Module):
             for s in r:
 
                 # With a loaded adapter the graph needs a LoRA stage holding it, or it would run without
-                if self.bc is not None and bsz * q_len <= MAX_BSZN and (self.lora_stage_ok or not self.has_lora()):
+                if self.bc is not None and bsz * q_len <= MAX_BSZN and (self.lora_stage_current() or not self.has_lora()):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))

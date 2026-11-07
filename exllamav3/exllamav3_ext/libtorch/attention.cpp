@@ -168,6 +168,9 @@ void BC_Attention::set_lora
     at::Tensor o_a, at::Tensor o_b, at::Tensor o_d
 )
 {
+    // A slot configured without the stage has no input staging, and its graph no sites for the stage's params
+    for (const Slot& s : slots)
+        TORCH_CHECK(!s.configured, "BC_Attention::set_lora: slots are already configured");
     lora_t = std::move(t);
     lora_q_a = std::move(q_a); lora_q_b = std::move(q_b); lora_q_d = std::move(q_d);
     lora_k_a = std::move(k_a); lora_k_b = std::move(k_b); lora_k_d = std::move(k_d);

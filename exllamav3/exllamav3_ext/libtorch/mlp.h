@@ -60,6 +60,8 @@ struct BC_GatedMLP
     at::Tensor lora_up_a, lora_up_b, lora_up_d;
     at::Tensor lora_down_a, lora_down_b, lora_down_d;
 
+    bool captured() const;      // any graph captured: too late for set_lora
+
     void set_lora
     (
         at::Tensor xs, at::Tensor t,
