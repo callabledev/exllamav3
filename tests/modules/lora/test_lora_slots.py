@@ -193,10 +193,66 @@ def test_rows_without_names_run_everything_loaded():
     assert module.lora_stage_ready(None, 3, 1) and table(slots, 3) == [(0, 2)] * 3
     assert module.lora_stage_ready({"lora_rows": [ALL_LORAS, None, a]}, 3, 1) and table(slots, 3) == [(0, 2), NONE, (0, 2)]
     load(module, b)
-    # two adapters on one row is more than a table of one adapter per row can say
+    # both on one row: 2 + 2 columns, more than the stage's scratch of RANK is wide
     assert not module.lora_stage_ready({}, 3, 1)
     assert not module.lora_stage_ready({"lora_rows": [ALL_LORAS, None, a]}, 3, 1)
     assert module.lora_stage_ready({"lora_rows": [b, None, a]}, 3, 1) and table(slots, 3) == [(2, 2), NONE, (0, 2)]
+
+
+def test_a_row_without_a_name_spans_every_loaded_adapter_when_their_ranks_fit():
+    module, slots = staged()
+    a, b, c = Adapter("a"), Adapter("b"), Adapter("c")
+    load(module, a, rank = 1, value = 1.0)
+    load(module, b, rank = 1, value = 2.0, linears = ("linear",))     # on one projection only: zeros on the other
+    load(module, c, rank = 1, value = 3.0)
+    assert module.lora_stage_ready({}, 2, 1) and table(slots, 2) == [(0, 3), (0, 3)]     # 1 + 1 + 1 columns, as one run
+    a_y, _ = module.lora_statics["y"]
+    assert a_y[0].eq(1).all() and not a_y[1].any() and a_y[2].eq(3).all()
+    assert module.lora_stage_ready({"lora_rows": [ALL_LORAS, c]}, 2, 1) and table(slots, 2) == [(0, 3), (2, 1)]
+
+    # b goes: a and c are apart, and are moved together for a row that runs both
+    unload(module, b)
+    layout = slots.layout
+    params = {"lora_rows": [c, ALL_LORAS, None]}
+    assert module.lora_stage_ready(params, 3, 1) and slots.placed == {a: (0, 1), c: (1, 1)} and slots.layout == layout + 1
+    assert table(slots, 3) == [(1, 1), (0, 2), NONE]
+    assert a_y[0].eq(1).all() and a_y[1].eq(3).all()
+    assert module.lora_stage_ready(params, 3, 1) and slots.layout == layout + 1 and table(slots, 3) == [(1, 1), (0, 2), NONE]
+
+    # and named rows alone never move anything
+    unload(module, a)
+    load(module, a, rank = 1, value = 1.0)
+    unload(module, c)
+    load(module, b, rank = 1, value = 2.0)
+    assert module.lora_stage_ready({"lora_rows": [a, b]}, 2, 1) and slots.layout == layout + 1
+
+
+def test_a_plan_made_before_the_adapters_moved_is_made_again():
+    module, slots = staged()
+    a, b, c = Adapter("a"), Adapter("b"), Adapter("c")
+    for adapter in (a, b, c):
+        load(module, adapter, rank = 1)
+    named = {"lora_rows": [c]}
+    assert module.lora_stage_ready(named, 1, 1) and table(slots, 1) == [(2, 1)]
+    unload(module, b)
+    assert module.lora_stage_ready(named, 1, 1) and table(slots, 1) == [(2, 1)]
+    assert module.lora_stage_ready({}, 1, 1) and table(slots, 1) == [(0, 2)]     # moves c beside a
+    assert module.lora_stage_ready(named, 1, 1) and table(slots, 1) == [(1, 1)]   # not the columns its plan had
+
+
+def test_an_adapter_of_other_widths_than_the_projections_gets_no_columns():
+    """It can't be copied in: left to the python path, which fails for the rows that run it, and for nobody else"""
+    module, slots = staged()
+    good, wide = Adapter("good"), Adapter("wide")
+    load(module, good)
+    module.linear.lora_a_tensors[wide] = torch.ones(IN + 2, 2, dtype = torch.half)
+    module.linear.lora_b_tensors[wide] = torch.ones(2, OUT, dtype = torch.half)
+    assert module.lora_stage_ready({"lora_rows": [good]}, 1, 1) and slots.unplaced == {wide}
+    assert not module.lora_stage_ready({"lora_rows": [wide]}, 1, 1) and not module.lora_stage_ready({}, 1, 1)
+    # made for another model's width, where there was room before
+    load(module, good, value = 2.0)
+    module.linear.lora_b_tensors[good] = torch.ones(2, OUT + 1, dtype = torch.half)
+    assert not module.lora_stage_ready({"lora_rows": [good]}, 1, 1) and slots.unplaced == {good, wide} and not slots.placed
 
 
 def test_every_token_of_a_row_gets_the_rows_adapter():

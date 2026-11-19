@@ -58,8 +58,8 @@ class Model(Model_TPMixin, Model_LSMixin):
         as many as its rank (default: `rank`, one adapter of that rank or several lower ones; a column costs the
         memory of one rank of an adapter). Each row of a batch then runs with its own adapter (a job's `lora`, or
         params["lora_rows"] in a forward) at the cost of that adapter's rank, whatever else is loaded. Without named
-        rows every row runs all loaded adapters, which the stage holds for one adapter. What the stage can't hold
-        runs on the python path, with the same result: see LoraSlots.
+        rows every row runs all loaded adapters, which the stage holds while their ranks come to `rank` at most.
+        What the stage can't hold runs on the python path, with the same result: see LoraSlots.
 
         Call once after the model loads, before any decode, with or without an adapter loaded. Modules where a
         stage can't be placed (including those whose graphs a decode already captured) return False and run on

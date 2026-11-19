@@ -202,13 +202,13 @@ class LoRA:
 
                 self.target_modules[module_key] = target
                 loaded += 1
+            model.sync_graph_lora()
         except BaseException:
             # Nothing may stay behind on the model: the caller gets no adapter to unload, and its tensors would
             # go on applying to every row that names none, and holding columns of the graph LoRA stages
             self.unload()
             raise
 
-        model.sync_graph_lora()
         print(
             f" -- LoRA '{self.name}': loaded {loaded} tensors "
             f"(r={self.lora_r}, alpha={self.lora_alpha:.0f}, "

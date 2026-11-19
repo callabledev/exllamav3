@@ -6,7 +6,8 @@
 // LoRA with a different adapter per row, for the decode graphs' LoRA stage: o[r] += x[r] @ A[s] @ B[s], s being
 // row r's adapter. The stage's statics hold several adapters side by side, each in as many columns as its rank, and
 // `slots` names each row's: (first column, rank) per row, rank 0 for no adapter (the row is left as it is). A row
-// costs what its own adapter's rank does, whatever else is loaded.
+// costs what its own adapter's rank does, whatever else is loaded. A range over several adapters next to each other
+// adds them all up.
 //
 // lora_down: t[r, j] = sum_k x[r, k] * a_t[col_r + j, k] for j < rank_r; t beyond a row's rank is not written
 //   x: (rows, K) fp16, a_t: (width, K) fp16 (A transposed, so an adapter's columns are contiguous rows),

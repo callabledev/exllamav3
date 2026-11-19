@@ -110,6 +110,36 @@ def test_lora_reaches_decode_with_and_without_a_graph_stage(model_id, model_dir,
     assert_matches_eager(again, first, tol = 1e-3)
 
 
+def both_scenario(model_dir: str, stage: bool) -> list:
+    """Two adapters loaded and no job naming one: every row runs both, their parts added up. [(label, tokens,
+    logits)] per prompt, as one batch"""
+    _, model, (cache,), tok = load_with_caches(model_dir, get_test_device())
+    if stage:
+        model.enable_graph_lora(RANK + RANK // 2)
+    first, second = RandomAdapter(model, 1), RandomAdapter(model, 2, rank = RANK // 2)
+    results = generate_with_logits(model, cache, tok, PROMPTS, NEW_TOKENS, max_batch_size = len(PROMPTS))
+    if stage:
+        assert model.lora_slots.declined == 0, "the stage holds both adapters' ranks, yet forwards left it"
+    runs = [(f"both #{i}", tokens, [l.cpu() for l in logits]) for i, (tokens, logits) in enumerate(results)]
+    second.unload()
+    results = generate_with_logits(model, cache, tok, PROMPTS[:1], NEW_TOKENS, max_batch_size = 1)
+    runs += [("first alone", results[0][0], [l.cpu() for l in results[0][1]])]
+    first.unload()
+    unload_model(model)
+    return runs
+
+
+@pytest.mark.models("dense")
+def test_jobs_that_name_no_adapter_run_all_loaded_ones_in_the_stage(model_id, model_dir, device):
+    env = device_env(device)
+    staged = run_isolated(both_scenario, model_dir, True, env = env, timeout = 900.0)
+    python = run_isolated(both_scenario, model_dir, False, env = env, timeout = 900.0)
+    assert_same_until_parting(staged, python)
+    by_label = {label: logits for label, _, logits in python}
+    assert _rfn(by_label["both #0"][1], by_label["first alone"][1]) > 0.05, \
+        f"{model_id}: the second adapter barely changes decode logits; test is vacuous"
+
+
 def assert_same_until_parting(got, expected, tol: float = 0.08, typical: float = 0.01, min_steps: int = 3):
     """
     Two runs of the same generations on paths that round differently (the stage accumulates its sums in fp32, the

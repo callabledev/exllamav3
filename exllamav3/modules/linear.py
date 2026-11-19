@@ -118,10 +118,12 @@ class LoraSlots:
 
     Adapters reach the columns by copy whenever the Linears' adapter dicts changed, whoever changed them: one that
     is loaded takes free columns and keeps them until it is unloaded. If the free columns would do but are in
-    pieces, the adapters are packed together first, between two forwards. A step the stages can't hold makes
-    ready() return False and runs on the python path, which gives the same result: one with a row whose adapter
-    found no room, or is above the stages' `rank`, or with a row running several adapters at once (two or more
-    loaded and nothing naming the rows' own).
+    pieces, the adapters are packed together first, between two forwards. A row that names no adapter runs all
+    that are loaded: their columns as one run, which adds up every adapter's part.
+
+    A step the stages can't hold makes ready() return False and runs on the python path, which gives the same
+    result: one with a row whose adapter found no room, is above the stages' `rank` or doesn't have the
+    projections' widths, or with a row running all the loaded adapters when their ranks come to more than `rank`.
     """
 
     def __init__(self, rank: int, columns: int, max_rows: int):
@@ -134,6 +136,7 @@ class LoraSlots:
         self.copied = {}                    # adapter -> (first column, [(stage, name, a, b)]) as last copied
         self.unplaced = set()               # loaded adapters with no columns
         self.synced = -1                    # _lora_generation at the last refresh
+        self.layout = 0                     # counts the times adapters were moved (pack)
         self.tables = {}                    # device -> int32 (max_rows, 2): each row's first column and rank
         self.table_rows = {}                # device -> what its table holds, as a tuple
         self.declined = 0                   # forwards the stages couldn't hold, per staged module (ready)
@@ -177,11 +180,12 @@ class LoraSlots:
 
 
     def pack(self):
-        """Move the adapters together, leaving the free columns in one piece. Their weights follow in refresh()"""
+        """Move the adapters together, leaving the free columns in one piece. Their weights follow (copy_placed)"""
         column = 0
         for lora, (_, rank) in sorted(self.placed.items(), key = lambda item: item[1]):
             self.placed[lora] = (column, rank)
             column += rank
+        self.layout += 1
 
 
     def refresh(self):
@@ -196,13 +200,19 @@ class LoraSlots:
         self.unplaced = set()
         for lora, parts in loaded.items():
             rank = max((max(a.shape[1], b.shape[0]) for _, _, a, b in parts), default = 0)
+            # One made for other widths than the projections' can't be copied in. The python path says so, to
+            # the rows that run it
+            fits = rank <= self.rank and all(
+                a.shape[0] == stage.lora_statics[name][0].shape[1] and b.shape[1] == stage.lora_statics[name][1].shape[1]
+                for stage, name, a, b in parts
+            )
             place = self.placed.get(lora)
-            if place is not None and place[1] != rank:
+            if place is not None and (place[1] != rank or not fits):
                 self.release(lora)
                 place = None
             if place is None and rank > 0:
-                column = self.find(rank) if rank <= self.rank else None
-                if column is None and rank <= min(self.rank, self.free()):
+                column = self.find(rank) if fits else None
+                if column is None and fits and rank <= self.free():
                     self.pack()
                     column = self.find(rank)
                 if column is None:
@@ -210,6 +220,12 @@ class LoraSlots:
                 else:
                     self.placed[lora] = (column, rank)
         # After every adapter has its place: packing moves the ones placed before
+        self.copy_placed(loaded)
+        self.synced = generation
+
+
+    def copy_placed(self, loaded: dict):
+        """Copy in the adapters whose weights or columns aren't the ones last copied"""
         for lora, (column, rank) in self.placed.items():
             parts = loaded[lora]
             copied = self.copied.get(lora)
@@ -218,7 +234,27 @@ class LoraSlots:
             ):
                 self.copy(column, rank, parts)
                 self.copied[lora] = (column, parts)
-        self.synced = generation
+
+
+    def everything(self) -> tuple | None:
+        """
+        (first column, rank) of a row that runs every loaded adapter, or None if the stages can't hold that: the
+        adapters' columns as one run, each projection adding up the parts of all of them (an adapter has zeros
+        where it has no weights). They are packed together for it if they aren't, which is between two forwards.
+        """
+        if self.unplaced:
+            return None
+        if not self.placed:
+            return (0, 0)
+        total = sum(rank for _, rank in self.placed.values())
+        if total > self.rank:
+            return None
+        first = min(column for column, _ in self.placed.values())
+        if max(column + rank for column, rank in self.placed.values()) - first != total:
+            self.pack()
+            self.copy_placed(self.loaded())
+            first = 0
+        return (first, total)
 
 
     def release(self, lora):
@@ -241,15 +277,13 @@ class LoraSlots:
     def row_places(self, params: dict | None, bsz: int, q_len: int) -> tuple | None:
         """(first column, rank) of every token row of a forward, flattened, or None if the stages can't hold it"""
         lora_rows = lora_rows_of(params, bsz * q_len)
-        # Every loaded adapter at once: nothing to add, or the one adapter there is
-        if self.unplaced or len(self.placed) > 1:
-            everything = None
-        else:
-            everything = next(iter(self.placed.values()), (0, 0))
         if lora_rows is None:
+            everything = self.everything()
             return None if everything is None else everything * (bsz * q_len)
         if len(lora_rows) != bsz:
             return None
+        if any(lora is ALL_LORAS for lora in lora_rows):
+            everything = self.everything()      # first: it may move the adapters
         places = ()
         for lora in lora_rows:
             if lora is None:
@@ -280,9 +314,11 @@ class LoraSlots:
             return False
         plan = params.get("lora_stage_plan") if params is not None else None
         lora_rows = params.get("lora_rows") if params is not None else None
-        key = (self, self.synced, bsz, q_len, None if lora_rows is None else tuple(lora_rows))
-        if plan is None or plan[0] != key:
-            plan = (key, self.row_places(params, bsz, q_len))
+        rows_key = None if lora_rows is None else tuple(lora_rows)
+        if plan is None or plan[0] != (self, self.synced, self.layout, bsz, q_len, rows_key):
+            places = self.row_places(params, bsz, q_len)
+            # The key after the places: making them may have moved the adapters
+            plan = ((self, self.synced, self.layout, bsz, q_len, rows_key), places)
             if params is not None:
                 params["lora_stage_plan"] = plan
         places = plan[1]
