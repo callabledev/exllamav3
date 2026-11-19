@@ -252,7 +252,11 @@ class LoraSlots:
         first = min(column for column, _ in self.placed.values())
         if max(column + rank for column, rank in self.placed.values()) - first != total:
             self.pack()
-            self.copy_placed(self.loaded())
+            try:
+                self.copy_placed(self.loaded())
+            except BaseException:
+                self.synced = -1    # the weights didn't all follow their adapters: refresh() copies them again
+                raise
             first = 0
         return (first, total)
 

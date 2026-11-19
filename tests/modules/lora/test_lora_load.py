@@ -19,8 +19,8 @@ IN, OUT, RANK = 6, 5, 2
 KEYS = ("model.layers.0.self_attn.q_proj", "model.layers.0.mlp.down_proj")
 
 
-def linear(key):
-    module = object.__new__(Linear)
+def linear(key, cls = Linear):
+    module = object.__new__(cls)
     module.key, module.in_features, module.out_features = key, IN, OUT
     module.device = torch.device("cpu")
     module.is_sliced = False
@@ -29,8 +29,8 @@ def linear(key):
 
 
 class Model:
-    def __init__(self, sync = None):
-        self.linears = [linear(key) for key in KEYS]
+    def __init__(self, sync = None, cls = Linear):
+        self.linears = [linear(key, cls) for key in KEYS]
         self.modules_dict = {m.key: m for m in self.linears}
         self.sync = sync
         self.synced = 0
@@ -79,9 +79,24 @@ def test_a_load_that_fails_in_the_stages_sync_leaves_nothing_on_the_model(tmp_pa
 
 
 def test_a_load_that_fails_on_a_tensor_leaves_nothing_on_the_model(tmp_path):
-    model = Model()
-    # The second projection can't be reached: its tensors fail to move there, after the first one's are on
-    model.linears[1].device = "no such device"
-    with pytest.raises(RuntimeError):
+    moved = []
+
+    class FailsLater(Linear):
+        """Its device can be read for the first projection's A and B, whichever the file has first, and no more"""
+        @property
+        def device(self):
+            if len(moved) == 2:
+                raise RuntimeError("CUDA out of memory")
+            moved.append(self.key)
+            return torch.device("cpu")
+
+        @device.setter
+        def device(self, _value):
+            pass
+
+    model = Model(cls = FailsLater)
+    with pytest.raises(RuntimeError, match = "out of memory"):
         LoRA.from_directory(model, adapter_dir(tmp_path))
+    assert len(moved) == 2 and moved[0] == moved[1]     # one projection's tensors were on when it failed
     assert all(not m.lora_a_tensors and not m.lora_b_tensors for m in model.linears)
+    assert model.synced == 1    # the unload told the stages

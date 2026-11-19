@@ -219,12 +219,28 @@ def test_a_row_without_a_name_spans_every_loaded_adapter_when_their_ranks_fit():
     assert a_y[0].eq(1).all() and a_y[1].eq(3).all()
     assert module.lora_stage_ready(params, 3, 1) and slots.layout == layout + 1 and table(slots, 3) == [(1, 1), (0, 2), NONE]
 
-    # and named rows alone never move anything
-    unload(module, a)
+
+def test_weights_that_failed_to_follow_their_adapters_are_copied_again():
+    """Moving the adapters together and then failing to copy them must not leave rows on columns of other weights"""
+    module, slots = staged()
+    a, b, c = Adapter("a"), Adapter("b"), Adapter("c")
     load(module, a, rank = 1, value = 1.0)
-    unload(module, c)
     load(module, b, rank = 1, value = 2.0)
-    assert module.lora_stage_ready({"lora_rows": [a, b]}, 2, 1) and slots.layout == layout + 1
+    load(module, c, rank = 1, value = 3.0)
+    assert module.lora_stage_ready({}, 1, 1)
+    unload(module, b)
+    assert module.lora_stage_ready({"lora_rows": [c]}, 1, 1)      # c stays in the third column while rows are named
+
+    copy = slots.copy
+    def failing(*args):
+        raise RuntimeError("device error")
+    slots.copy = failing
+    with pytest.raises(RuntimeError, match = "device error"):
+        module.lora_stage_ready({}, 1, 1)                           # moves c beside a, and the copy fails
+    slots.copy = copy
+    assert module.lora_stage_ready({}, 1, 1) and table(slots, 1) == [(0, 2)]
+    a_x, b_x = module.lora_statics["x"]
+    assert a_x[0].eq(1).all() and a_x[1].eq(3).all() and b_x[1].eq(6).all()
 
 
 def test_a_plan_made_before_the_adapters_moved_is_made_again():
