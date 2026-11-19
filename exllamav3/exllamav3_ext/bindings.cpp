@@ -17,6 +17,7 @@
 #include "routing.cuh"
 #include "gdn.cuh"
 #include "add.cuh"
+#include "lora.cuh"
 #include "dflash2.cuh"
 
 #include "quant/quantize.cuh"
@@ -234,6 +235,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("mul_softplus_broadcast_", &mul_softplus_broadcast_, "mul_softplus_broadcast_");
     m.def("add_sigmoid_gate_proj", &add_sigmoid_gate_proj, "add_sigmoid_gate_proj");
     m.def("add", &add, "add");
+    m.def("lora_down", &lora_down, "lora_down");
+    m.def("lora_up", &lora_up, "lora_up");
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");

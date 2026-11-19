@@ -5,7 +5,8 @@ if TYPE_CHECKING:
     from .generator import Generator
 from ..constants import PAGE_SIZE
 import numpy as np
-from .pagetable import Sequence, tensor_hash_checksum, random_hash
+from .pagetable import Sequence, tensor_hash_checksum, random_hash, lora_cache_salt
+from ..modules.linear import ALL_LORAS
 from .filter import Filter
 import random
 import time
@@ -65,6 +66,7 @@ class Job:
         max_rq_tokens: int | None = None,
         stop_on_loop: tuple[int, int] = None,
         rq_state: dict | None = None,
+        lora: object = ALL_LORAS,
         **kwargs
     ):
         """
@@ -140,6 +142,13 @@ class Job:
         :param rq_state:
             Internal, passed when job requeues itself
 
+        :param lora:
+            The adapter this job runs with, of those loaded on the model: the object its tensors are registered
+            under on the Linears (a LoRA), or None for the base model. Jobs with different adapters generate in
+            the same batch, and each adapter's prompts are cached apart (see lora_cache_salt). Default: every
+            loaded adapter, as a model without named adapters runs; the cache then doesn't know what was loaded.
+            Don't mix that with named adapters in one generator.
+
         :param kwargs:
         """
 
@@ -206,7 +215,9 @@ class Job:
             assert ids.shape[0] == 1, \
                 "input_ids must be [1, seq_len] tensor or list of [1, seq_len] tensors"
             seq = Sequence(ids, seq_ids)
+            seq.salt = lora_cache_salt(lora)
             self.sequences.append(seq)
+        self.lora = lora
         assert len(self.sequences) == 1, \
             "A job holds exactly one sequence (multi-sequence jobs are not supported)"
 
@@ -655,7 +666,7 @@ class Job:
             last_hash = None
 
         page_ids = seq.sequence_ids.torch_slice(page_idx * PAGE_SIZE, (page_idx + 1) * PAGE_SIZE)
-        new_hash = tensor_hash_checksum(page_ids, last_hash)
+        new_hash = tensor_hash_checksum(page_ids, last_hash, seq.salt)
 
         # A deferred page may already anchor a recurrent checkpoint, stashed under the hash it had when
         # the position crossed the boundary. Move it along so it stays findable under the final hash
@@ -1234,6 +1245,7 @@ class Job:
             max_rq_tokens = self.orig_max_rq_tokens,
             stop_on_loop = self.stop_on_loop,
             rq_state = rq_state,
+            lora = self.lora,
         )
 
         rq_job.prepare_for_queue(generator, serial_number, rq = True)
@@ -1426,6 +1438,9 @@ class Job:
                 for page in self.pagetable.all_pages:
                     if page.prev_hash != prev_hash or id(page) == id(seq.allocated_pages[p0]):
                         continue
+                    # A first page has no previous hash to tell another adapter's K/V by
+                    if page.salt != seq.salt:
+                        continue
                     match = ext.count_match_tensor(page.sequence, prefill_ids, page.kv_position)
                     if match > best_match:
                         best_match = match
@@ -1543,6 +1558,8 @@ class Job:
                     "inv_freq": self.alt_rope_freqs,
                     "mm_span_prefix": mm_span_prefix,
                 }
+                if self.lora is not ALL_LORAS:
+                    params["lora_rows"] = [self.lora]
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
                 if self.generator.mtp_draft:

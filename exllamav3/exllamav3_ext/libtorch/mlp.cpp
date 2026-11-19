@@ -8,6 +8,7 @@
 #include "../quant/exl3_gemm.cuh"
 #include "../activation.cuh"
 #include "../add.cuh"
+#include "../lora.cuh"
 
 using namespace torch::indexing;
 
@@ -20,18 +21,20 @@ bool BC_GatedMLP::captured() const
 
 void BC_GatedMLP::set_lora
 (
-    at::Tensor xs, at::Tensor t,
-    at::Tensor gate_a, at::Tensor gate_b, at::Tensor gate_d,
-    at::Tensor up_a, at::Tensor up_b, at::Tensor up_d,
-    at::Tensor down_a, at::Tensor down_b, at::Tensor down_d
+    at::Tensor slots, at::Tensor xs, at::Tensor t,
+    at::Tensor gate_a, at::Tensor gate_b,
+    at::Tensor up_a, at::Tensor up_b,
+    at::Tensor down_a, at::Tensor down_b
 )
 {
     TORCH_CHECK(!captured(), "BC_GatedMLP::set_lora: graphs are already captured");
+    TORCH_CHECK(slots.dim() == 2 && slots.size(0) >= MAX_BSZN, "BC_GatedMLP::set_lora: slots must cover MAX_BSZN rows");
+    lora_slots = std::move(slots);
     lora_xs = std::move(xs);
     lora_t = std::move(t);
-    lora_gate_a = std::move(gate_a); lora_gate_b = std::move(gate_b); lora_gate_d = std::move(gate_d);
-    lora_up_a = std::move(up_a); lora_up_b = std::move(up_b); lora_up_d = std::move(up_d);
-    lora_down_a = std::move(down_a); lora_down_b = std::move(down_b); lora_down_d = std::move(down_d);
+    lora_gate_a = std::move(gate_a); lora_gate_b = std::move(gate_b);
+    lora_up_a = std::move(up_a); lora_up_b = std::move(up_b);
+    lora_down_a = std::move(down_a); lora_down_b = std::move(down_b);
     lora_enabled = true;
 }
 
@@ -112,14 +115,10 @@ void BC_GatedMLP::run_bszN_gr
     {
         at::Tensor g2 = gu_n.select(0, 0);
         at::Tensor u2 = gu_n.select(0, 1);
-        at::Tensor gd = lora_gate_d.narrow(0, 0, num_tokens);
-        at::Tensor ud = lora_up_d.narrow(0, 0, num_tokens);
-        hgemm_gr(lora_x_n, lora_gate_a, lora_t_n, graph);
-        hgemm_gr(lora_t_n, lora_gate_b, gd, graph);
-        add_gr(g2, gd, g2, graph);
-        hgemm_gr(lora_x_n, lora_up_a, lora_t_n, graph);
-        hgemm_gr(lora_t_n, lora_up_b, ud, graph);
-        add_gr(u2, ud, u2, graph);
+        lora_down_gr(lora_x_n, lora_gate_a, lora_slots, lora_t_n, graph);
+        lora_up_gr(lora_t_n, lora_gate_b, lora_slots, g2, false, graph);
+        lora_down_gr(lora_x_n, lora_up_a, lora_slots, lora_t_n, graph);
+        lora_up_gr(lora_t_n, lora_up_b, lora_slots, u2, false, graph);
     }
 
     at::Tensor g = gu_n.select(0, 0).unsqueeze(0);
@@ -139,10 +138,8 @@ void BC_GatedMLP::run_bszN_gr
     if (lora_enabled)
     {
         at::Tensor a2 = a_n.view({num_tokens, a_n.size(-1)});
-        at::Tensor dd = lora_down_d.narrow(0, 0, num_tokens);
-        hgemm_gr(a2, lora_down_a, lora_t_n, graph);
-        hgemm_gr(lora_t_n, lora_down_b, dd, graph);
-        add_gr(d, dd, d, graph);
+        lora_down_gr(a2, lora_down_a, lora_slots, lora_t_n, graph);
+        lora_up_gr(lora_t_n, lora_down_b, lora_slots, d, true, graph);
     }
 }
 
@@ -200,10 +197,7 @@ void BC_GatedMLP::run_bszN
             args.emplace_back(GP_add_z, (void*) d.data_ptr());
         }
         if (lora_enabled)
-        {
-            args.emplace_back(GP_add_x, (void*) d.data_ptr());
-            args.emplace_back(GP_add_z, (void*) d.data_ptr());
-        }
+            args.emplace_back(GP_lora_up_o, (void*) d.data_ptr());
 
         g.launch(args, stream);
     }

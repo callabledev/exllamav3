@@ -12,6 +12,9 @@ if TYPE_CHECKING:
 from ..constants import PAGE_SIZE
 from collections import deque, defaultdict
 from itertools import pairwise
+import itertools
+import weakref
+from ..modules.linear import ALL_LORAS
 from ..util.tensor import SeqTensor
 from exllamav3.ext import exllamav3_ext as ext
 import time
@@ -20,8 +23,9 @@ from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..util import profile_opt
 
 
-def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
-    hasher = hashlib.blake2b(digest_size = 16)
+def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None, salt: bytes | None = None) -> bytes:
+    # The salt (lora_cache_salt) gives every adapter chains of its own for the same tokens
+    hasher = hashlib.blake2b(digest_size = 16, salt = salt) if salt else hashlib.blake2b(digest_size = 16)
     if prev_hash is not None:
         hasher.update(prev_hash)
     hasher.update(tensor.numpy().tobytes())
@@ -35,6 +39,48 @@ def _randomhash():
 
 tensor_hash_checksum = _tensor_blake2b_checksum
 random_hash = _randomhash
+
+_lora_object_keys = weakref.WeakKeyDictionary()
+_lora_object_count = itertools.count(1)
+
+def lora_cache_salt(lora) -> bytes | None:
+    """
+    16 bytes that keep the cached pages of jobs running with different adapters apart (a job's `lora`): K/V
+    computed with one adapter is no prefix for a prompt running with another. None, for no salt, with the base
+    model, and with ALL_LORAS, where the caller answers for what is loaded, as before adapters could be named.
+
+    An adapter's `cache_key` (bytes or str), if it has one, stands for its weights: its pages outlive the adapter
+    object and serve any adapter with the same key. Without one each adapter object gets a key of its own, never
+    another object's, also after it is gone (a str, bytes or int the tensors are registered under, such as a
+    name, is its own key). Either way the salt doesn't see the weights: after putting other tensors under the same
+    adapter, give it another `cache_key`, or what was cached with the old weights serves the new.
+    """
+    if lora is None or lora is ALL_LORAS:
+        return None
+    key = getattr(lora, "cache_key", None)
+    if key is None:
+        if isinstance(lora, (str, bytes, int)):
+            key = f"adapter value {type(lora).__name__} {lora!r}"
+        else:
+            try:
+                key = _lora_object_keys.get(lora)
+                if key is None:
+                    key = b"adapter object %d" % next(_lora_object_count)
+                    _lora_object_keys[lora] = key
+            except TypeError:
+                # No weak reference to it (__slots__, unhashable): the key goes on the object itself. Nothing
+                # derived from it would do, since its address can be another adapter's later
+                key = b"adapter object %d" % next(_lora_object_count)
+                try:
+                    lora.cache_key = key
+                except AttributeError:
+                    raise TypeError(
+                        f"{type(lora).__name__} takes neither a weak reference nor a cache_key attribute: give "
+                        f"the adapter a cache_key naming its weights"
+                    ) from None
+    if isinstance(key, str):
+        key = key.encode("utf8")
+    return hashlib.blake2b(key, digest_size = 16).digest()
 
 def is_content_hash(h: bytes) -> bool:
     # Random (placeholder) hashes are counter values whose top eight bytes stay zero; a blake2b content
@@ -55,6 +101,10 @@ class CachePage:
     # Hash of previous page in chain
     prev_hash: bytes | None
     prev_hash_revert: bytes | None
+
+    # Salt of the sequence the page's K/V was computed for (lora_cache_salt): part of its hash
+    salt: bytes | None
+    salt_revert: bytes | None
 
     # Number of active jobs referencing page
     ref_count: int
@@ -109,6 +159,7 @@ class CachePage:
     def backup(self):
         self.phash_revert = self.phash
         self.prev_hash_revert = self.prev_hash
+        self.salt_revert = self.salt
         self.access_serial_revert = self.access_serial
         self.kv_position_revert = self.kv_position
         self.can_revert = True
@@ -118,6 +169,7 @@ class CachePage:
         assert self.can_revert
         self.phash = self.phash_revert
         self.prev_hash = self.prev_hash_revert
+        self.salt = self.salt_revert
         self.access_serial = self.access_serial_revert
         self.kv_position = self.kv_position_revert
         self.can_revert = False
@@ -133,10 +185,11 @@ class CachePage:
         self.can_revert = False
 
     # Increase reference count and clear page
-    def add_ref_clear(self, serial, newhash):
+    def add_ref_clear(self, serial, newhash, salt = None):
         assert self.ref_count == 0
         del self.pagetable.unreferenced_pages[self.phash]
         self.phash = newhash
+        self.salt = salt
         assert self.phash not in self.pagetable.referenced_pages
         self.pagetable.referenced_pages[self.phash] = self
         self.ref_count += 1
@@ -146,11 +199,12 @@ class CachePage:
         self.kv_position = 0
 
     # Add reference to (currently) unique page
-    def add_ref_unique(self, serial):
+    def add_ref_unique(self, serial, salt = None):
         self.backup()
         assert self.ref_count == 0
         del self.pagetable.unreferenced_pages[self.phash]
         self.phash = _randomhash()
+        self.salt = salt
         assert self.phash not in self.pagetable.referenced_pages
         self.pagetable.referenced_pages[self.phash] = self
         self.ref_count += 1
@@ -186,7 +240,7 @@ class CachePage:
     # Update hash
     def update_hash(self, newhash = None):
         if newhash is None:
-            newhash = tensor_hash_checksum(self.sequence, self.prev_hash)
+            newhash = tensor_hash_checksum(self.sequence, self.prev_hash, self.salt)
         assert self.ref_count > 0
         assert self.kv_position == PAGE_SIZE
         del self.pagetable.referenced_pages[self.phash]
@@ -220,6 +274,9 @@ class Sequence:
         self.live = True
         self.prefill_complete = False
 
+        # Keeps this sequence's cached pages apart from other adapters' (lora_cache_salt)
+        self.salt = None
+
         # Multimodal token spans
         self.multimodal_mask = ids[0] >= FIRST_MM_EMBEDDING_INDEX
 
@@ -242,7 +299,7 @@ class Sequence:
             # TODO: profile/optimize hash function
             page_ids = self.sequence_ids.torch_slice(i * PAGE_SIZE, (i + 1) * PAGE_SIZE)
             assert page_ids.shape[-1] == PAGE_SIZE
-            r_hash = tensor_hash_checksum(page_ids, r_hash)
+            r_hash = tensor_hash_checksum(page_ids, r_hash, self.salt)
             self.page_hashes.append(r_hash)
             unique_hashes.add(r_hash)
 
@@ -282,7 +339,7 @@ class Sequence:
 
         # Allocate pages in KV cache, limit prefix caching to available recurrent states
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
-            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes, restore_limit)
+            pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes, restore_limit, self.salt)
 
         # Prepare block index
         self.build_block_index_tensor()
@@ -363,6 +420,8 @@ class PageTable:
                 phash_revert = h,
                 prev_hash = None,
                 prev_hash_revert = None,
+                salt = None,
+                salt_revert = None,
                 sequence = torch.empty((1, PAGE_SIZE), dtype = torch.long),
                 ref_count = 0,
                 access_serial = idx,
@@ -532,10 +591,12 @@ class PageTable:
         new_unique_pages: int,
         recurrent_pages: list[int] | None,
         protected_hashes: set | None = None,
-        restore_limit: int | None = None
+        restore_limit: int | None = None,
+        salt: bytes | None = None,
     ):
         """
-        Allocate physical cache pages for one sequence.
+        Allocate physical cache pages for one sequence. `salt` is the sequence's (the hashes already carry it): the
+        pages it will write take it.
 
         Existing full prompt pages are resolved by hash first, reusing referenced pages for shared prefixes or
         unreferenced pages for prompt-cache hits. A page hash missing from VRAM but present in the CPU tier is
@@ -586,7 +647,7 @@ class PageTable:
                 # simply falls through to normal prefill.
                 else:
                     op = next_evictable()
-                    op.add_ref_clear(self.access_serial, h)
+                    op.add_ref_clear(self.access_serial, h, salt)
                     if (
                         self.cpu_tier is not None and
                         (restore_limit is None or lp < restore_limit) and
@@ -604,7 +665,7 @@ class PageTable:
         for npi in range(new_unique_pages):
             self.access_serial += 1
             op = next_evictable()
-            op.add_ref_unique(self.access_serial)
+            op.add_ref_unique(self.access_serial, salt)
             # Link the first fresh page to a complete cached prefix. Normally the link is written when the
             # preceding page completes during generation, but when a requeued job resumes on a fully cached
             # prompt that moment lies in the previous round, and without the link every requeue round would
@@ -807,7 +868,7 @@ class PageTable:
         # Check individual hashes
         for page in self.all_pages:
             if page.kv_position == PAGE_SIZE and page.phash[:8] != b'\x00\x00\x00\x00\x00\x00\x00\x00':
-                h = tensor_hash_checksum(page.sequence, page.prev_hash)
+                h = tensor_hash_checksum(page.sequence, page.prev_hash, page.salt)
                 p_assert(page.phash == h)
 
         # Check job sequences

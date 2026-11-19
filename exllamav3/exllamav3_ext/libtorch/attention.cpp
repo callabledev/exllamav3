@@ -10,6 +10,7 @@
 #include "../rope.cuh"
 #include "../cache/q_cache.cuh"
 #include "../add.cuh"
+#include "../lora.cuh"
 #include "../activation.cuh"
 #include "../norm.cuh"
 #include "../dsa_topk.cuh"
@@ -161,21 +162,23 @@ BC_Attention::BC_Attention
 
 void BC_Attention::set_lora
 (
-    at::Tensor t,
-    at::Tensor q_a, at::Tensor q_b, at::Tensor q_d,
-    at::Tensor k_a, at::Tensor k_b, at::Tensor k_d,
-    at::Tensor v_a, at::Tensor v_b, at::Tensor v_d,
-    at::Tensor o_a, at::Tensor o_b, at::Tensor o_d
+    at::Tensor row_slots, at::Tensor t,
+    at::Tensor q_a, at::Tensor q_b,
+    at::Tensor k_a, at::Tensor k_b,
+    at::Tensor v_a, at::Tensor v_b,
+    at::Tensor o_a, at::Tensor o_b
 )
 {
     // A slot configured without the stage has no input staging, and its graph no sites for the stage's params
     for (const Slot& s : slots)
         TORCH_CHECK(!s.configured, "BC_Attention::set_lora: slots are already configured");
+    TORCH_CHECK(row_slots.dim() == 2 && row_slots.size(0) >= t.size(0), "BC_Attention::set_lora: slots must cover every row of t");
+    lora_slots = std::move(row_slots);
     lora_t = std::move(t);
-    lora_q_a = std::move(q_a); lora_q_b = std::move(q_b); lora_q_d = std::move(q_d);
-    lora_k_a = std::move(k_a); lora_k_b = std::move(k_b); lora_k_d = std::move(k_d);
-    lora_v_a = std::move(v_a); lora_v_b = std::move(v_b); lora_v_d = std::move(v_d);
-    lora_o_a = std::move(o_a); lora_o_b = std::move(o_b); lora_o_d = std::move(o_d);
+    lora_q_a = std::move(q_a); lora_q_b = std::move(q_b);
+    lora_k_a = std::move(k_a); lora_k_b = std::move(k_b);
+    lora_v_a = std::move(v_a); lora_v_b = std::move(v_b);
+    lora_o_a = std::move(o_a); lora_o_b = std::move(o_b);
     lora_enabled = true;
 }
 
@@ -569,20 +572,14 @@ void BC_Attention::run_gr
     if (lora_enabled)
     {
         lora_t_r = lora_t.narrow(0, 0, R);
-        at::Tensor qd = lora_q_d.narrow(0, 0, R);
-        at::Tensor kd = lora_k_d.narrow(0, 0, R);
-        at::Tensor vd = lora_v_d.narrow(0, 0, R);
         at::Tensor k2 = kv2.select(0, 0);
         at::Tensor v2 = kv2.select(0, 1);
-        hgemm_gr(x2, lora_q_a, lora_t_r, graph);
-        hgemm_gr(lora_t_r, lora_q_b, qd, graph);
-        add_gr(s.q2, qd, s.q2, graph);
-        hgemm_gr(x2, lora_k_a, lora_t_r, graph);
-        hgemm_gr(lora_t_r, lora_k_b, kd, graph);
-        add_gr(k2, kd, k2, graph);
-        hgemm_gr(x2, lora_v_a, lora_t_r, graph);
-        hgemm_gr(lora_t_r, lora_v_b, vd, graph);
-        add_gr(v2, vd, v2, graph);
+        lora_down_gr(x2, lora_q_a, lora_slots, lora_t_r, graph);
+        lora_up_gr(lora_t_r, lora_q_b, lora_slots, s.q2, false, graph);
+        lora_down_gr(x2, lora_k_a, lora_slots, lora_t_r, graph);
+        lora_up_gr(lora_t_r, lora_k_b, lora_slots, k2, false, graph);
+        lora_down_gr(x2, lora_v_a, lora_slots, lora_t_r, graph);
+        lora_up_gr(lora_t_r, lora_v_b, lora_slots, v2, false, graph);
     }
 
     if (v_norm && !use_k_as_v)
@@ -886,10 +883,8 @@ void BC_Attention::run_gr
         add_gr(c2, o_proj->bias.value(), c2, graph);
     if (lora_enabled)
     {
-        at::Tensor od = lora_o_d.narrow(0, 0, R);
-        hgemm_gr(s.o2, lora_o_a, lora_t_r, graph);
-        hgemm_gr(lora_t_r, lora_o_b, od, graph);
-        add_gr(c2, od, c2, graph);
+        lora_down_gr(s.o2, lora_o_a, lora_slots, lora_t_r, graph);
+        lora_up_gr(lora_t_r, lora_o_b, lora_slots, c2, true, graph);
     }
     if (hs != hidden_size)
         copy2d_gr(c2, y2, graph);
@@ -1069,10 +1064,7 @@ void BC_Attention::run
         params.emplace_back(GP_add_z, yptr);
     }
     if (lora_enabled)
-    {
-        params.emplace_back(GP_add_x, yptr);
-        params.emplace_back(GP_add_z, yptr);
-    }
+        params.emplace_back(GP_lora_up_o, yptr);
     if (padded)
         params.emplace_back(GP_copy2d_dst, (void*) y.data_ptr());
     s.graph->launch(params, stream);

@@ -96,7 +96,9 @@ enum GraphedParams
 
     GP_moe_bias_add_sel,
     GP_moe_bias_add_weighted_sel,
-    GP_moe_bias_add_weighted_weights
+    GP_moe_bias_add_weighted_weights,
+
+    GP_lora_up_o
 };
 
 class Graph

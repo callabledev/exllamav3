@@ -44,37 +44,49 @@ class Model(Model_TPMixin, Model_LSMixin):
         # Modules dict
         self.modules_dict = None
 
+        # The adapters in the graph LoRA stages (enable_graph_lora)
+        self.lora_slots = None
+
         # Check compatibility
         self.check_compat()
 
 
-    def enable_graph_lora(self, rank: int) -> dict:
+    def enable_graph_lora(self, rank: int, columns: int | None = None) -> dict:
         """
-        Give graphed decode paths a LoRA stage of up to this rank, so loaded adapters don't push decode onto the
-        python path. Call once after the model loads, before any decode, with or without an adapter loaded.
-        Modules where it can't be placed (including those whose graphs a decode already captured) return False
-        and run on the python path while an adapter is loaded. Returns counts, for logging.
+        Give graphed decode paths a LoRA stage, so loaded adapters don't push decode onto the python path. It
+        holds adapters of up to this rank, loaded at the same time, in `columns` columns between them, each taking
+        as many as its rank (default: `rank`, one adapter of that rank or several lower ones; a column costs the
+        memory of one rank of an adapter). Each row of a batch then runs with its own adapter (a job's `lora`, or
+        params["lora_rows"] in a forward) at the cost of that adapter's rank, whatever else is loaded. Without named
+        rows every row runs all loaded adapters, which the stage holds while their ranks come to `rank` at most.
+        What the stage can't hold runs on the python path, with the same result: see LoraSlots.
+
+        Call once after the model loads, before any decode, with or without an adapter loaded. Modules where a
+        stage can't be placed (including those whose graphs a decode already captured) return False and run on
+        the python path while an adapter is loaded. Returns counts, for logging.
         """
+        from ..modules.linear import LoraSlots
+        from ..modules.attention_fn.bc_attn import MAX_R
+        assert self.lora_slots is None, "enable_graph_lora was already called for this model"
+        self.lora_slots = LoraSlots(rank, max(columns or rank, rank), MAX_R)
         counts = {"stage": 0, "python": 0}
         for module in self:
             enable = getattr(module, "enable_graph_lora", None)
             if enable is None:
                 continue
-            counts["stage" if enable(rank) else "python"] += 1
+            counts["stage" if enable(self.lora_slots) else "python"] += 1
         self.sync_graph_lora()
         return counts
 
 
     def sync_graph_lora(self):
         """
-        Copy the loaded adapters into the graph stages now. Optional: a stage notices any change to the Linears'
-        adapters and copies them in at its next decode step; LoRA calls this on load and unload, so that step
+        Copy the loaded adapters into the graph stages now. Optional: the stages notice any change to the Linears'
+        adapters and copy them in at the next decode step; LoRA calls this on load and unload, so that step
         doesn't pay for the copy.
         """
-        for module in self:
-            sync = getattr(module, "sync_graph_lora", None)
-            if sync is not None:
-                sync()
+        if self.lora_slots is not None:
+            self.lora_slots.refresh()
 
 
     def __iter__(self):
@@ -473,6 +485,7 @@ class Model(Model_TPMixin, Model_LSMixin):
     def unload(self):
         for module in self.modules:
             module.unload()
+        self.lora_slots = None
         # The loader's open slab blocks must not outlive the tensors sliced from them
         self.config.stc.release_arena()
         self.active_devices = []

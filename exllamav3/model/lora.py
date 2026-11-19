@@ -3,7 +3,8 @@ LoRA (Low-Rank Adaptation) support for ExLlamaV3.
 
 Loads PEFT-format LoRA adapters and applies them at runtime without
 modifying base model weights. Multiple adapters can be loaded
-simultaneously; all loaded adapters are applied during forward pass.
+simultaneously; all loaded adapters are applied during forward pass,
+unless the rows of a batch name their own.
 
 Usage::
 
@@ -13,11 +14,27 @@ Usage::
     # Unload to revert to base model
     lora.unload()
 
+A different adapter per job::
+
+    a = LoRA.from_directory(model, "/path/to/adapter-a")
+    b = LoRA.from_directory(model, "/path/to/adapter-b")
+    # These generate in one batch, each row with its job's adapter (None: the base model)
+    generator.enqueue(Job(input_ids = ids_1, lora = a))
+    generator.enqueue(Job(input_ids = ids_2, lora = b))
+    generator.enqueue(Job(input_ids = ids_3, lora = None))
+
+A forward names them as ``params["lora_rows"]``, one entry per batch row. The prefix cache keeps each adapter's
+prompts apart (generator.pagetable.lora_cache_salt): give an adapter a ``cache_key`` naming its weights if what was
+cached with it should serve it again after an unload and a new load. A job that names no adapter runs with all
+that are loaded, and the cache doesn't know which those were: don't mix the two in one generator.
+
 The graphed decode paths have no LoRA of their own. With an adapter loaded, Attention, GatedMLP and MLP take the python
-path, unless ``model.enable_graph_lora(rank)`` was called after the model loaded, before any decode, which keeps the
-Attention and GatedMLP graphs at the cost of a stage per projection. Adapters of up to that rank, one at a time, then
-reach the stages by copy, whoever puts them on the Linears. The other graphed decode paths (MLA, DSA, gated delta net,
-Mamba2, block-sparse MoE, DSV4) don't check: adapters on their projections reach prefill only.
+path, unless ``model.enable_graph_lora(rank, columns)`` was called after the model loaded, before any decode, which
+keeps the Attention and GatedMLP graphs at the cost of a stage per projection. Adapters of up to that rank then reach
+the stages by copy, whoever puts them on the Linears, side by side in as many of the stages' columns as their rank,
+and each row of a decode step runs with its own at the cost of that adapter's rank. The other graphed decode paths
+(MLA, DSA, gated delta net, Mamba2, block-sparse MoE, DSV4) don't check: adapters on their projections reach prefill
+only.
 
 Compatible with adapters trained via PEFT/Unsloth on the full-precision
 base model. LoRA weights are applied on top of the dequantized output
@@ -118,74 +135,80 @@ class LoRA:
         skipped_keys = []
         tp_skipped = []
 
-        for key, tensor in raw_tensors.items():
-            # Skip non-LoRA keys (e.g. modules_to_save, original_module)
-            if ".lora_A." not in key and ".lora_B." not in key:
-                continue
+        try:
+            for key, tensor in raw_tensors.items():
+                # Skip non-LoRA keys (e.g. modules_to_save, original_module)
+                if ".lora_A." not in key and ".lora_B." not in key:
+                    continue
 
-            # Extract full path and lora half from PEFT key
-            full_path, lora_half = self._parse_key(key)
-            if full_path is None:
-                skipped_keys.append(key)
-                continue
+                # Extract full path and lora half from PEFT key
+                full_path, lora_half = self._parse_key(key)
+                if full_path is None:
+                    skipped_keys.append(key)
+                    continue
 
-            # Match against model modules by suffix to handle any
-            # PEFT key prefix (base_model.model.*, etc.)
-            target = None
-            module_key = None
-            path_parts = full_path.split(".")
-            for start in range(len(path_parts)):
-                candidate = ".".join(path_parts[start:])
-                t = model.modules_dict.get(candidate)
-                if t is not None and isinstance(t, Linear):
-                    target = t
-                    module_key = candidate
-                    break
+                # Match against model modules by suffix to handle any
+                # PEFT key prefix (base_model.model.*, etc.)
+                target = None
+                module_key = None
+                path_parts = full_path.split(".")
+                for start in range(len(path_parts)):
+                    candidate = ".".join(path_parts[start:])
+                    t = model.modules_dict.get(candidate)
+                    if t is not None and isinstance(t, Linear):
+                        target = t
+                        module_key = candidate
+                        break
 
-            if target is None:
-                skipped_keys.append(key)
-                continue
+                if target is None:
+                    skipped_keys.append(key)
+                    continue
 
-            # Tensor-parallel sliced modules not supported
-            if target.is_sliced:
-                tp_skipped.append(key)
-                continue
+                # Tensor-parallel sliced modules not supported
+                if target.is_sliced:
+                    tp_skipped.append(key)
+                    continue
 
-            if tensor.dtype in (torch.bfloat16, torch.float32):
-                tensor = tensor.to(torch.float16)
+                if tensor.dtype in (torch.bfloat16, torch.float32):
+                    tensor = tensor.to(torch.float16)
 
-            # Transpose for efficient matmul: x @ A @ B
-            # PEFT stores lora_A as [rank, in_features] and
-            # lora_B as [out_features, rank].
-            # We want A as [in_features, rank] and B as [rank, out_features].
-            tensor = tensor.T.contiguous()
+                # Transpose for efficient matmul: x @ A @ B
+                # PEFT stores lora_A as [rank, in_features] and
+                # lora_B as [out_features, rank].
+                # We want A as [in_features, rank] and B as [rank, out_features].
+                tensor = tensor.T.contiguous()
 
-            # Pre-scale B matrix
-            if lora_half == "lora_B" and self.lora_scaling != 1.0:
-                tensor.mul_(self.lora_scaling)
+                # Pre-scale B matrix
+                if lora_half == "lora_B" and self.lora_scaling != 1.0:
+                    tensor.mul_(self.lora_scaling)
 
-            # Pad to match target dimensions (quantized layers may pad features to multiples of block size)
-            if lora_half == "lora_A" and tensor.shape[0] < target.in_features:
-                padded = torch.zeros(target.in_features, tensor.shape[1], dtype=tensor.dtype)
-                padded[:tensor.shape[0]] = tensor
-                tensor = padded
-            elif lora_half == "lora_B" and tensor.shape[1] < target.out_features:
-                padded = torch.zeros(tensor.shape[0], target.out_features, dtype=tensor.dtype)
-                padded[:, :tensor.shape[1]] = tensor
-                tensor = padded
+                # Pad to match target dimensions (quantized layers may pad features to multiples of block size)
+                if lora_half == "lora_A" and tensor.shape[0] < target.in_features:
+                    padded = torch.zeros(target.in_features, tensor.shape[1], dtype=tensor.dtype)
+                    padded[:tensor.shape[0]] = tensor
+                    tensor = padded
+                elif lora_half == "lora_B" and tensor.shape[1] < target.out_features:
+                    padded = torch.zeros(tensor.shape[0], target.out_features, dtype=tensor.dtype)
+                    padded[:, :tensor.shape[1]] = tensor
+                    tensor = padded
 
-            tensor = tensor.to(target.device)
+                tensor = tensor.to(target.device)
 
-            # Register on target module
-            if lora_half == "lora_A":
-                target.lora_a_tensors[self] = tensor
-            else:
-                target.lora_b_tensors[self] = tensor
+                # Register on target module
+                if lora_half == "lora_A":
+                    target.lora_a_tensors[self] = tensor
+                else:
+                    target.lora_b_tensors[self] = tensor
 
-            self.target_modules[module_key] = target
-            loaded += 1
+                self.target_modules[module_key] = target
+                loaded += 1
+            model.sync_graph_lora()
+        except BaseException:
+            # Nothing may stay behind on the model: the caller gets no adapter to unload, and its tensors would
+            # go on applying to every row that names none, and holding columns of the graph LoRA stages
+            self.unload()
+            raise
 
-        model.sync_graph_lora()
         print(
             f" -- LoRA '{self.name}': loaded {loaded} tensors "
             f"(r={self.lora_r}, alpha={self.lora_alpha:.0f}, "

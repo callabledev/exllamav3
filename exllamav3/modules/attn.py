@@ -645,10 +645,10 @@ class Attention(Module, GraphLoraStage):
                    (self.q_proj, getattr(self, "k_proj", None), getattr(self, "v_proj", None), self.g_proj, self.o_proj))
 
 
-    def enable_graph_lora(self, rank: int) -> bool:
+    def enable_graph_lora(self, slots) -> bool:
         """
-        Give the graphed decode path a LoRA stage of up to this rank, or return False where it has none (the
-        python path then runs whenever an adapter is loaded). Call before any decode has captured a slot;
+        Give the graphed decode path a LoRA stage holding the model's LoraSlots, or return False where it has none
+        (the python path then runs whenever an adapter is loaded). Call before any decode has captured a slot;
         adapters then reach the stage as copies, with no recapture.
         """
         if (
@@ -661,7 +661,7 @@ class Attention(Module, GraphLoraStage):
             any(b and b.slot_widths for b in self.bc_attn.values())
         ):
             return False
-        self.lora_statics = self.make_lora_statics(rank)
+        self.make_lora_statics(slots)
         for b in self.bc_attn.values():
             if b:
                 b.bind_lora()
@@ -674,10 +674,11 @@ class Attention(Module, GraphLoraStage):
 
     def lora_bc_args(self) -> list:
         from .attention_fn.bc_attn import MAX_R
-        rank = self.lora_statics["q"][0].shape[1]
-        args = [g_tensor_cache.get(self.device, (MAX_R, rank), torch.half, "lora_attn_t")]
-        for name, p in self.lora_targets():
-            args += [*self.lora_statics[name], g_tensor_cache.get(self.device, (MAX_R, p.out_features), torch.half, f"lora_attn_{name}d")]
+        slots = self.lora_slots
+        assert slots.max_rows >= MAX_R
+        args = [slots.table(self.device), g_tensor_cache.get(self.device, (MAX_R, slots.rank), torch.half, "lora_attn_t")]
+        for name, _ in self.lora_targets():
+            args += [*self.lora_statics[name]]
         return args
 
 
@@ -1170,11 +1171,11 @@ class Attention(Module, GraphLoraStage):
 
         # Graph-captured C++ path for the whole decode attention block (causality is baked
         # into the slot kernels, so non-causal callers like the DFlash draft graph too)
-        # With a loaded adapter the graph needs a LoRA stage holding it, or it would run without
+        # With a loaded adapter the graph needs a LoRA stage holding each row's, or it would run without
         if (
             _bc_attn_enable and non_causal_spans is None and
             bsz <= _bc_max_bsz and seqlen <= _bc_max_qlen and
-            (self.lora_stage_current() or not self.has_lora())
+            self.lora_stage_ready(params, bsz, seqlen)
         ):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
                                   host_seqlens = qsa_seqlens_cpu)

@@ -14,6 +14,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 from .job import Job
+from ..modules.linear import ALL_LORAS
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
 from .sampler import Sampler
@@ -1215,6 +1216,10 @@ class Generator:
             "recurrent_history": draft_tokens is not None,
             "pinned_staging": True,
         }
+        # Each row's adapter, when a job names its own
+        lora_rows = [job.lora for job in batch_jobs for _ in job.sequences]
+        if any(lora is not ALL_LORAS for lora in lora_rows):
+            params["lora_rows"] = lora_rows
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
         batch_logits = self.model.forward(

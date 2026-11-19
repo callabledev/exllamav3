@@ -7,6 +7,7 @@ from ..model.config import Config
 from ..util.device_copy import host_to_device
 from ..util.tensor import to2
 from . import Module, Linear
+from .linear import lora_rows_for_tokens
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
@@ -1340,7 +1341,11 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                     else:
 
                         # Torch path
-                        def mlp(exp_i, xc):
+                        def mlp(exp_i, xc, params = params):
+                            # The expert's tokens come from any batch rows: each brings its own row's adapter
+                            if self.ups[exp_i].lora_a_tensors or self.downs[exp_i].lora_a_tensors or \
+                                    (self.gated and self.gates[exp_i].lora_a_tensors):
+                                params = lora_rows_for_tokens(params, top_x, y.shape[0])
                             u = self.ups[exp_i].forward(xc, params)
                             if self.gated:
                                 g = self.gates[exp_i].forward(xc, params)
