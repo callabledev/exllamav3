@@ -3,7 +3,8 @@ LoRA (Low-Rank Adaptation) support for ExLlamaV3.
 
 Loads PEFT-format LoRA adapters and applies them at runtime without
 modifying base model weights. Multiple adapters can be loaded
-simultaneously; all loaded adapters are applied during forward pass.
+simultaneously; all loaded adapters are applied during forward pass,
+unless the rows of a batch name their own.
 
 Usage::
 
@@ -13,11 +14,27 @@ Usage::
     # Unload to revert to base model
     lora.unload()
 
+A different adapter per job::
+
+    a = LoRA.from_directory(model, "/path/to/adapter-a")
+    b = LoRA.from_directory(model, "/path/to/adapter-b")
+    # These generate in one batch, each row with its job's adapter (None: the base model)
+    generator.enqueue(Job(input_ids = ids_1, lora = a))
+    generator.enqueue(Job(input_ids = ids_2, lora = b))
+    generator.enqueue(Job(input_ids = ids_3, lora = None))
+
+A forward names them as ``params["lora_rows"]``, one entry per batch row. The prefix cache keeps each adapter's
+prompts apart (generator.pagetable.lora_cache_salt): give an adapter a ``cache_key`` naming its weights if what was
+cached with it should serve it again after an unload and a new load. A job that names no adapter runs with all
+that are loaded, and the cache doesn't know which those were: don't mix the two in one generator.
+
 The graphed decode paths have no LoRA of their own. With an adapter loaded, Attention, GatedMLP and MLP take the python
-path, unless ``model.enable_graph_lora(rank)`` was called after the model loaded, before any decode, which keeps the
-Attention and GatedMLP graphs at the cost of a stage per projection. Adapters of up to that rank, one at a time, then
-reach the stages by copy, whoever puts them on the Linears. The other graphed decode paths (MLA, DSA, gated delta net,
-Mamba2, block-sparse MoE, DSV4) don't check: adapters on their projections reach prefill only.
+path, unless ``model.enable_graph_lora(rank, columns)`` was called after the model loaded, before any decode, which
+keeps the Attention and GatedMLP graphs at the cost of a stage per projection. Adapters of up to that rank then reach
+the stages by copy, whoever puts them on the Linears, side by side in as many of the stages' columns as their rank,
+and each row of a decode step runs with its own at the cost of that adapter's rank. The other graphed decode paths
+(MLA, DSA, gated delta net, Mamba2, block-sparse MoE, DSV4) don't check: adapters on their projections reach prefill
+only.
 
 Compatible with adapters trained via PEFT/Unsloth on the full-precision
 base model. LoRA weights are applied on top of the dequantized output

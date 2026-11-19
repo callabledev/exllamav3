@@ -836,19 +836,18 @@ class GatedMLP(Module, GraphLoraStage):
                 self.multi_gu[i] = None
 
 
-    def enable_graph_lora(self, rank: int):
+    def enable_graph_lora(self, slots):
         """
-        Give the graphed decode path a LoRA stage of up to this rank, or return False where it has none (the
-        python path then runs whenever an adapter is loaded). Call before any decode has captured a graph;
-        adapters then reach the stage as copies, with no recapture. Zero weights (no adapter) cost the same
-        as a loaded adapter.
+        Give the graphed decode path a LoRA stage holding the model's LoraSlots, or return False where it has none
+        (the python path then runs whenever an adapter is loaded). Call before any decode has captured a graph;
+        adapters then reach the stage as copies, with no recapture.
         """
         if self.bc is None or self.num_slices != 1 or not hasattr(self.bc, "set_lora") or self.bc.captured():
             return False
         g, d = self.gates[0], self.downs[0]
         if g.in_features != self.hidden_size or d.out_features != self.hidden_size:
             return False
-        self.lora_statics = self.make_lora_statics(rank)
+        self.make_lora_statics(slots)
         self.bind_lora()
         return True
 
@@ -859,16 +858,17 @@ class GatedMLP(Module, GraphLoraStage):
 
     def bind_lora(self):
         """Hand the statics to the current BC object (also after pin_linears rebuilt it)"""
-        g, u, d = self.gates[0], self.ups[0], self.downs[0]
-        rank = self.lora_statics["gate"][0].shape[1]
+        slots = self.lora_slots
+        assert slots.max_rows >= MAX_BSZN
         def scratch(shape, tag):
             return g_tensor_cache.get(self.device, shape, torch.half, tag)
         self.bc.set_lora(
-            scratch((MAX_BSZN, g.in_features), "lora_mlp_xs"),
-            scratch((MAX_BSZN, rank), "lora_mlp_t"),
-            *self.lora_statics["gate"], scratch((MAX_BSZN, g.out_features), "lora_mlp_gd"),
-            *self.lora_statics["up"], scratch((MAX_BSZN, u.out_features), "lora_mlp_ud"),
-            *self.lora_statics["down"], scratch((MAX_BSZN, d.out_features), "lora_mlp_dd"),
+            slots.table(self.device),
+            scratch((MAX_BSZN, self.gates[0].in_features), "lora_mlp_xs"),
+            scratch((MAX_BSZN, slots.rank), "lora_mlp_t"),
+            *self.lora_statics["gate"],
+            *self.lora_statics["up"],
+            *self.lora_statics["down"],
         )
 
 
@@ -911,8 +911,8 @@ class GatedMLP(Module, GraphLoraStage):
 
             for s in r:
 
-                # With a loaded adapter the graph needs a LoRA stage holding it, or it would run without
-                if self.bc is not None and bsz * q_len <= MAX_BSZN and (self.lora_stage_current() or not self.has_lora()):
+                # With a loaded adapter the graph needs a LoRA stage holding each row's, or it would run without
+                if self.bc is not None and bsz * q_len <= MAX_BSZN and self.lora_stage_ready(params, bsz, q_len):
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
                     self.bc.run_bszN(xv, d.view(xv.shape))

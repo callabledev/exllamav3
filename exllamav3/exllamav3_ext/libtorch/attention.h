@@ -255,21 +255,23 @@ struct BC_Attention
     );
 
     // Optional LoRA stage (see BC_GatedMLP::set_lora), set before any slot captures. Forces input
-    // staging: cublas nodes have no patchable sites. Weights are statics: a swap copies into them
+    // staging. Weights are statics holding several adapters: loading one copies into them, and
+    // lora_slots names each row's
     bool lora_enabled = false;
-    at::Tensor lora_t;                              // (MAX_R, r) scratch
-    at::Tensor lora_q_a, lora_q_b, lora_q_d;        // (K, r), (r, N), (MAX_R, N)
-    at::Tensor lora_k_a, lora_k_b, lora_k_d;
-    at::Tensor lora_v_a, lora_v_b, lora_v_d;
-    at::Tensor lora_o_a, lora_o_b, lora_o_d;
+    at::Tensor lora_slots;                  // int32 (rows, 2): a row's first column in the statics and its rank, 0 for no adapter
+    at::Tensor lora_t;                      // (MAX_R, highest rank) scratch
+    at::Tensor lora_q_a, lora_q_b;          // (W, K) A transposed, (W, N)
+    at::Tensor lora_k_a, lora_k_b;
+    at::Tensor lora_v_a, lora_v_b;
+    at::Tensor lora_o_a, lora_o_b;
 
     void set_lora
     (
-        at::Tensor t,
-        at::Tensor q_a, at::Tensor q_b, at::Tensor q_d,
-        at::Tensor k_a, at::Tensor k_b, at::Tensor k_d,
-        at::Tensor v_a, at::Tensor v_b, at::Tensor v_d,
-        at::Tensor o_a, at::Tensor o_b, at::Tensor o_d
+        at::Tensor slots, at::Tensor t,
+        at::Tensor q_a, at::Tensor q_b,
+        at::Tensor k_a, at::Tensor k_b,
+        at::Tensor v_a, at::Tensor v_b,
+        at::Tensor o_a, at::Tensor o_b
     );
 
     void set_qsa
