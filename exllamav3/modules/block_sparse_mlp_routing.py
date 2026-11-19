@@ -17,7 +17,7 @@ ROUTING_CACHE_ROWS = 128
 
 
 def _routing_buffers(cfg, bsz, device):
-    """Router outputs for a multi-row call: (router_logits (bsz, E) half, selected_experts
+    """Router outputs for a multi-row call: (router_logits (bsz, E) cfg.logits_dtype, selected_experts
     (bsz, K) long, routing_weights (bsz, K) half). Decode/MTP-class row counts (verify windows,
     small batches: up to ROUTING_CACHE_ROWS) take bucketed workspaces from the per-device static
     cache, shared by every MoE layer on the device: a layer's routing outputs are consumed by
@@ -31,7 +31,7 @@ def _routing_buffers(cfg, bsz, device):
     else:
         ws = lambda numel, dtype, tag: torch.empty((numel,), dtype = dtype, device = device)
     return (
-        ws(bsz * E, torch.half, "moe_route_logits").view(bsz, E),
+        ws(bsz * E, cfg.logits_dtype, "moe_route_logits").view(bsz, E),
         ws(bsz * K, torch.long, "moe_route_sel").view(bsz, K),
         ws(bsz * K, torch.half, "moe_route_w").view(bsz, K),
     )
@@ -71,16 +71,22 @@ class RoutingCFG:
     e_score_bias_vl: torch.Tensor | None = None   # DeepSeek-V4 vision: selection bias for image rows
     gate_i8: torch.Tensor | None = None     # (2, E, K) int8 hi/lo slices, lazy (see _gate_i8)
     gate_sb: torch.Tensor | None = None     # (E) fp32 row scales
+    gate_tensor_f32: torch.Tensor | None = None       # grouped DS3 router: fp32 gate for multi-row logits, lazy
+    e_score_bias_f32: torch.Tensor | None = None      # grouped DS3 router: fp32 selection bias, lazy
+    router_logits_f32_bsz1: torch.Tensor | None = None   # grouped DS3 router: single-row fp32 logits, lazy
+    logits_dtype: torch.dtype = torch.half   # std routers: float = fp32 projection, top-k on unrounded logits
 
 
 def _gate_t(cfg):
     """Transposed (E, K) half gate for the single-row GEMV, plus the int8 hi/lo slices and row
     scales for the deterministic multi-row projection (ext.routing_gemm_det), both built lazily
     (weights may be deferred when the RoutingCFG is constructed). Builds without the deterministic
-    projection leave the int8 slices unset and route on the half gate."""
+    projection leave the int8 slices unset and route on the half gate, as do fp32-logit routers
+    (their projection reads the half gate for every row count)."""
     if cfg.gate_tensor_t is None:
         cfg.gate_tensor_t = cfg.gate_tensor.T.contiguous()
-    if cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half:
+    if cfg.gate_i8 is None and ext.HAS_DET_GEMM and cfg.gate_tensor_t.dtype == torch.half \
+            and cfg.logits_dtype == torch.half:
         E, K = cfg.gate_tensor_t.shape
         cfg.gate_i8 = torch.empty((2, E, K), dtype = torch.int8, device = cfg.gate_tensor_t.device)
         cfg.gate_sb = torch.empty((E,), dtype = torch.float, device = cfg.gate_tensor_t.device)
@@ -172,8 +178,41 @@ def routing_std_bias(bsz, cfg, y, params):
 
 # TODO: Optimize top_k groups (for DS3)
 def routing_ds3(bsz, cfg, y, params):
+    """Group-limited DS3 routing (n_group > 1): fp32 logits (the reference gate's precision;
+    with hundreds of experts the selection margins sit below fp16 resolution), group scores
+    from each group's two best biased scores, the topk_group best groups eligible, top-K over
+    those, weights from the unbiased scores. Single rows project with the fixed-order fp32
+    GEMV, other row counts with an fp32 matmul; selection and weights run in one kernel
+    (routing_ds3_group). The torch composition stays for the all-experts calibration pass."""
+    if params.get("activate_all_experts"):
+        return _routing_ds3_torch(bsz, cfg, y, params)
+    E, K = cfg.num_experts, cfg.num_experts_per_tok
+    if cfg.e_score_bias_f32 is None and cfg.e_score_correction_bias is not None:
+        cfg.e_score_bias_f32 = cfg.e_score_correction_bias.float().contiguous()
+    if bsz == 1:
+        _gate_t(cfg)
+        if cfg.router_logits_f32_bsz1 is None:
+            cfg.router_logits_f32_bsz1 = torch.empty((1, E), dtype = torch.float, device = y.device)
+        logits = cfg.router_logits_f32_bsz1
+        ext.routing_gemv_f32(y.view(-1), cfg.gate_tensor_t, logits.view(-1))
+        selected_experts, routing_weights = cfg.selected_experts_bsz1, cfg.routing_weights_bsz1
+    else:
+        if cfg.gate_tensor_f32 is None:
+            cfg.gate_tensor_f32 = cfg.gate_tensor.float().contiguous()
+        logits = torch.matmul(y.view(-1, y.shape[-1]).float(), cfg.gate_tensor_f32)
+        _, selected_experts, routing_weights = _routing_buffers(cfg, bsz, y.device)
+    ext.routing_ds3_group(
+        logits, cfg.e_score_bias_f32, selected_experts, routing_weights,
+        cfg.routed_scaling_factor, ROUTING_ACT_SIGMOID, cfg.n_group, cfg.topk_group,
+    )
+    return selected_experts, routing_weights
+
+
+def _routing_ds3_torch(bsz, cfg, y, params):
+    """Torch composition of the group-limited DS3 router (the all-experts calibration pass,
+    and the reference the kernel is tested against)"""
     activate_all_experts = params.get("activate_all_experts")
-    router_logits = torch.matmul(y, cfg.gate_tensor)
+    router_logits = torch.matmul(y.float(), cfg.gate_tensor.float())
 
     scores = router_logits.sigmoid()
     scores_for_choice = scores.view(-1, cfg.num_experts)
@@ -193,7 +232,8 @@ def routing_ds3(bsz, cfg, y, params):
         .expand(-1, cfg.n_group, cfg.num_experts // cfg.n_group)
         .reshape(-1, cfg.num_experts)
     )
-    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+    # -inf, not 0: the selection bias can push eligible scores below zero
+    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
 
     topk_indices = torch.topk(
         scores_for_choice,
@@ -205,7 +245,8 @@ def routing_ds3(bsz, cfg, y, params):
     denominator = topk_weights.sum(dim = -1, keepdim = True) + 1e-20
     topk_weights /= denominator
     topk_weights = topk_weights * cfg.routed_scaling_factor
-    return topk_indices, topk_weights
+    # half weights, as every other router returns (TP broadcast buffers and the decode kernels)
+    return topk_indices, topk_weights.half()
 
 
 def routing_dots(bsz, cfg, y, params):

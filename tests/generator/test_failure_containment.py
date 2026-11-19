@@ -53,7 +53,10 @@ class StubJob:
         if self.fail_in == "allocate_pages":
             raise RuntimeError(f"allocation failure for {self.name}")
 
-    def prefill(self, results):
+    def is_prefill_done(self):
+        return False
+
+    def prefill(self, results, chunk_size = None):
         if self.fail_in == "prefill":
             raise RuntimeError(f"prefill failure for {self.name}")
 
@@ -65,10 +68,14 @@ class StubJob:
 
 def make_generator(pending, active = (), max_batch_size = 16):
     generator = Generator.__new__(Generator)
+    generator.pipeline = None
     generator.pagetable = StubPagetable()
     generator.pending_jobs = list(pending)
     generator.active_jobs = list(active)
     generator.max_batch_size = max_batch_size
+    # No disk tier: iterate() consults it after the job stages
+    generator.disk_page_cache = None
+    generator.disk_cache_write_interval = 0
     return generator
 
 
@@ -141,6 +148,11 @@ def test_failing_prefill_is_contained_in_iterate():
     generator.draft_cache = None
     generator.recurrent_cache = None
     generator.draft_model = None
+    generator.max_chunk_size = 2048
+    generator.shared_chunk_size = 2048
+    generator.prefill_cooldown = 0
+    generator.prefill_cooldown_left = 0
+    generator.prefill_rotation = 0
     generator.ngram_match_min = 0
     generator.hybrid_draft_tokens = 0
     generator.visualizer = None
@@ -181,6 +193,7 @@ def test_async_deliver_error_as_raw_exception():
 
 def test_sync_generate_raises_on_error_result():
     generator = Generator.__new__(Generator)
+    generator.pipeline = None
 
     def fake_enqueue(job):
         job.serial_number = 0

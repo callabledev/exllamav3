@@ -11,7 +11,7 @@ import torch
 
 from exllamav3.constants import PAGE_SIZE
 from exllamav3.generator.job import Job
-from exllamav3.generator.pagetable import Sequence, lora_cache_salt, tensor_hash_checksum
+from exllamav3.generator.pagetable import Sequence, lora_cache_persistable, lora_cache_salt, tensor_hash_checksum
 from exllamav3.modules.linear import ALL_LORAS
 
 pytestmark = pytest.mark.nogpu
@@ -99,3 +99,23 @@ def test_default_job_names_no_adapter():
     job = Job(input_ids = torch.tensor([[1, 2, 3]]))
     assert job.lora is ALL_LORAS and job.sequences[0].salt is None
     assert Job(input_ids = torch.tensor([[1, 2, 3]]), lora = None).lora is None
+
+
+def test_only_adapters_with_a_key_of_their_own_are_cached_across_processes():
+    """The disk tier keeps a page for other processes: a key made up for an adapter object here is another
+    adapter's there"""
+    class Slotted:
+        __slots__ = ("cache_key",)
+
+    named, plain, slotted = Adapter(), Adapter(), Slotted()
+    named.cache_key = "voice-1"
+    assert lora_cache_persistable(None) and lora_cache_persistable(ALL_LORAS)
+    assert lora_cache_persistable(named) and lora_cache_persistable("voice-1")
+    assert not lora_cache_persistable(plain)
+    assert not lora_cache_persistable(slotted) and not lora_cache_persistable(slotted)      # with its made-up key on it too
+    assert lora_cache_salt(slotted) == lora_cache_salt(slotted)
+
+    ids = torch.arange(2 * PAGE_SIZE + 5).view(1, -1)
+    assert Job(input_ids = ids, lora = named).sequences[0].salt_persistable
+    assert not Job(input_ids = ids, lora = plain).sequences[0].salt_persistable
+    assert Job(input_ids = ids).sequences[0].salt_persistable

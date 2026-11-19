@@ -15,6 +15,10 @@ class InferParams:
     Runtime inference parameters. Configure before loading model/modules
     """
 
+    # Conversion only: keep block-scaled fp4/fp8 checkpoint linears packed as stored and dequantize to fp16 per
+    # use (LinearFP16Packed), so a layer of hundreds of fp4 experts costs a quarter of its fp16 footprint
+    packed_fp16_source: bool = False
+
     # Avoid reconstruct path during GEMM. Forces use of low-bsz GEMM/GEMV kernels. Also disables MGEMM path
     no_reconstruct: bool = False
 
@@ -47,6 +51,11 @@ class InferParams:
         # CPU GEMMs overlap each layer's own GPU expert compute. Mutually exclusive with
         # moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts
         self.moe_cpu_split = int(os.environ.get("EXL3_MOE_CPU_SPLIT", 0))
+        # Pinned expert arena for the CPU worker: the worker's expert weights live in
+        # shared chunks the parent maps and page-locks, so streamed prefill DMAs expert blocks
+        # straight out of the arena and the per-layer split can promote experts into spare GPU
+        # slots on the fly (see moe_cpu_host.MoeCpuTuning). EXL3_MOE_PINNED_ARENA is the default
+        self.moe_cpu_pinned_arena = os.environ.get("EXL3_MOE_PINNED_ARENA", "0") != "0"
         self.moe_cpu_component = "text"
         # Worker thread count per component; None defers to EXL3_MOE_CPU_THREADS, then MoeCpuTuning
         # (see moe_cpu_host.MoeCpuTuning)
@@ -102,6 +111,7 @@ class Config(ABC):
         directory: str,
         model_classes: dict,
         layer_map: list[int] | str | None = None,
+        config_key: str | None = None,
         **kwargs,
     ):
         """
@@ -138,6 +148,16 @@ class Config(ABC):
         assert arch == self.arch_string, \
             f"Unexpected architecture {arch} in {self.config_filename}, should be {self.arch_string}."
         self.architecture = arch
+
+        # Some multimodal wrappers keep the language model's HF config in a named sub-dict.
+        # The wrapper architecture is still checked above, while architecture-specific parsers
+        # can read model dimensions and layer layouts from the nested language-model config.
+        if config_key is not None:
+            assert config_key in self.config_dict, \
+                f"Missing {config_key!r} in {self.config_filename}"
+            # Keep wrapper-level token IDs and shared generation settings available while
+            # using the nested config as the source of language-model dimensions.
+            self.config_dict = {**self.config_dict[config_key], **self.config_dict}
 
         # Collect all .safetensors files in directory
         self.stc = SafetensorsCollection(directory, kwargs.get("load_method"), self.get_tensor_name_fixes())

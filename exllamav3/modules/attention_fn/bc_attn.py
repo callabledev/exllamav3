@@ -73,6 +73,26 @@ class BCKernelTooLarge(RuntimeError):
 _SPLIT_WARPS, _SPLIT_STAGES = ATTN_SPLIT_WARPS_STAGES
 
 
+def signature_to_ast(fn, signature: dict, pointer_range_32: bool = False) -> tuple[dict, dict]:
+    """Convert a ":16"-suffixed BC signature into the plain signature + specialization attrs for
+    ASTSource. A ":16" suffix declares the argument 16-byte divisible (pointer alignment /
+    scalar divisibility), matching the JIT's specialization -- without it the AOT kernel loses
+    vectorized global loads (~1.5x on bandwidth-heavy kernels), and on some AMD parts the
+    unspecialized compile of wide-K tiles miscompiles outright (gfx1100, triton 3.7.1). Every
+    launch MUST then honor the alignment."""
+    attrs = {}
+    sig = {}
+    for name, ty in signature.items():
+        if isinstance(ty, str) and ty.endswith(":16"):
+            sig[name] = ty[:-3]
+            attrs[(fn.arg_names.index(name),)] = [["tt.divisibility", 16]]
+        else:
+            sig[name] = ty
+        if pointer_range_32 and isinstance(sig[name], str) and sig[name].startswith("*"):
+            attrs.setdefault((fn.arg_names.index(name),), []).append(["tt.pointer_range", 32])
+    return sig, attrs
+
+
 def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
                     num_warps: int, num_stages: int, pointer_range_32: bool = False):
     """pointer_range_32 (AMD backend): every pointer argument addresses an allocation under 2 GB, which lets
@@ -83,20 +103,7 @@ def _compile_kernel(device: torch.device, fn, signature: dict, constexprs: dict,
     if k is None:
         import triton
         from triton.compiler import ASTSource
-        # A ":16" suffix on a signature entry declares the argument 16-byte divisible
-        # (pointer alignment / scalar divisibility), matching the JIT's specialization --
-        # without it the AOT kernel loses vectorized global loads (~1.5x on
-        # bandwidth-heavy kernels). Every launch MUST then honor the alignment
-        attrs = {}
-        sig = {}
-        for name, ty in signature.items():
-            if isinstance(ty, str) and ty.endswith(":16"):
-                sig[name] = ty[:-3]
-                attrs[(fn.arg_names.index(name),)] = [["tt.divisibility", 16]]
-            else:
-                sig[name] = ty
-            if pointer_range_32 and isinstance(sig[name], str) and sig[name].startswith("*"):
-                attrs.setdefault((fn.arg_names.index(name),), []).append(["tt.pointer_range", 32])
+        sig, attrs = signature_to_ast(fn, signature, pointer_range_32)
         with torch.cuda.device(device):
             src = ASTSource(fn = fn, signature = sig, constexprs = constexprs, attrs = attrs)
             ck = triton.compile(src, options = {"num_warps": num_warps, "num_stages": num_stages})
@@ -151,7 +158,8 @@ class BCAttn:
         self.num_kv_heads = module.num_kv_heads
         self.hidden_size = module.hidden_size
         self.sm_scale = module.sm_scale
-        self.window_size = module.sliding_window
+        wr = getattr(module, "window_right", 0)
+        self.window_size = (module.sliding_window, wr) if wr and module.sliding_window >= 0 else module.sliding_window
         self.softcap = module.logit_softcapping
 
         self.quant = k_bits > 0
@@ -523,7 +531,7 @@ class BCAttn:
             wts.fill_(1.0)
             cap = self.qsa_layer.pooled.shape[0] * self.qsa_layer.pooled.shape[1]
             s_max = -(-cap // 128) * 128
-            scores = sbuf("bca_qsa_scores", R, s_max)
+            scores = sbuf("bca_qsa_scores", R, s_max, dtype = idx.SCORE_DTYPE)
             # The scoring kernel writes only [0, T); the graphed warmup top-k scans the full
             # static width, so the tail must hold -inf from this one-time fill (the captured
             # graph patches the top-k scan width to T afterwards; eager calls narrow it to T)
@@ -533,7 +541,8 @@ class BCAttn:
 
             k_fewq = _compile_kernel(dev, _dsa_indexer_fewq_kernel,
                 {"q_idx": "*fp16:16", "w": "*fp16:16", "k_idx": "*fp16:16",
-                 "scores": "*fp16:16", "T": "i32", "R": "i32", "q_pos0": "i32",
+                 "scores": "*fp32:16" if idx.SCORE_DTYPE == torch.float else "*fp16:16",
+                 "T": "i32", "R": "i32", "q_pos0": "i32",
                  "bound_max": "i32", "block_table": "*i32:16", "num_pages_per_row": "i32"}
                 | {n: "constexpr" for n in (
                     "H_i", "H_pad", "D_i", "S_stride", "compress_rate", "scale", "BLOCK_N",
