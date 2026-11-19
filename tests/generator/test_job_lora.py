@@ -45,8 +45,31 @@ def test_cache_key_stands_for_the_weights():
 def test_an_adapter_named_by_a_plain_value_is_its_own_key():
     """Tensors may be registered under a name: no weak reference to a str, and the same name is the same adapter"""
     assert lora_cache_salt("voice-1") == lora_cache_salt("".join(["voice", "-1"])) != lora_cache_salt("voice-2")
-    assert lora_cache_salt(("voice", 1)) != lora_cache_salt("voice-1")
+    assert lora_cache_salt(b"voice-1") != lora_cache_salt("voice-1") != lora_cache_salt(1)
     assert Job(input_ids = torch.tensor([[1, 2, 3]]), lora = "voice-1").sequences[0].salt == lora_cache_salt("voice-1")
+
+
+def test_an_object_that_takes_no_weak_reference_keeps_its_key_on_itself():
+    """Nothing read off the object would do: its address can be another adapter's later"""
+    class Slotted:
+        __slots__ = ("cache_key",)
+
+    class Bare:
+        __slots__ = ()
+
+    first, second = Slotted(), Slotted()
+    assert lora_cache_salt(first) == lora_cache_salt(first) != lora_cache_salt(second)
+    with pytest.raises(TypeError, match = "cache_key"):
+        lora_cache_salt(Bare())
+
+
+def test_all_loras_is_no_value_an_adapter_could_have():
+    import copy
+    import pickle
+    assert ALL_LORAS != "all" and repr(ALL_LORAS) == "ALL_LORAS"
+    assert pickle.loads(pickle.dumps(ALL_LORAS)) is ALL_LORAS and copy.deepcopy(ALL_LORAS) is ALL_LORAS
+    job = Job(input_ids = torch.tensor([[1, 2, 3]]), lora = "".join(["a", "ll"]))    # an adapter named "all"
+    assert job.lora is not ALL_LORAS and job.sequences[0].salt == lora_cache_salt("all") is not None
 
 
 def test_pages_hash_apart_per_adapter_and_as_before_without_one():

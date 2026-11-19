@@ -308,3 +308,30 @@ def test_tokens_picked_from_a_forward_keep_their_rows_adapters():
 
     x, out, w = python_path([b, a, None, b], 4, 1, [a, b])     # what the expert's Linear then does with them
     assert torch.allclose(out[0], x[0] @ w[b][0] @ w[b][1], atol = 1e-5) and not out[2].any()
+
+
+def test_a_module_that_dropped_its_stage_is_left_out():
+    """A module loaded again or unloaded by itself resets its stage: the slots go on with the others"""
+    module, slots = staged()
+    other = FakeModule()
+    other.make_lora_statics(slots)
+    a = Adapter("a")
+    load(module, a)
+    load(other, a)
+    assert module.lora_stage_ready({}, 1, 1) and slots.stages == [module, other]
+    other.reset_graph_lora()
+    load(module, Adapter("b"))
+    assert module.lora_stage_ready({}, 1, 1) is False and slots.stages == [module]     # two adapters, no names
+    assert module.lora_stage_ready({"lora_rows": [a]}, 1, 1)
+
+
+def test_tokens_may_be_a_tensor_read_only_when_rows_are_named():
+    a = Adapter("a")
+    picked = lora_rows_for_tokens({"lora_rows": [a, None]}, torch.tensor([3, 0]), 4)
+    assert picked["lora_rows"] == [None, a]
+
+    class NeverRead:
+        def tolist(self):
+            raise AssertionError("no rows are named: the tokens need not be fetched")
+
+    assert lora_rows_for_tokens({}, NeverRead(), 4) == {}

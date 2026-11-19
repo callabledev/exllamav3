@@ -1345,7 +1345,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             # The expert's tokens come from any batch rows: each brings its own row's adapter
                             if self.ups[exp_i].lora_a_tensors or self.downs[exp_i].lora_a_tensors or \
                                     (self.gated and self.gates[exp_i].lora_a_tensors):
-                                params = lora_rows_for_tokens(params, top_x.tolist(), y.shape[0])
+                                params = lora_rows_for_tokens(params, top_x, y.shape[0])
                             u = self.ups[exp_i].forward(xc, params)
                             if self.gated:
                                 g = self.gates[exp_i].forward(xc, params)

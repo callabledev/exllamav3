@@ -135,16 +135,9 @@ def assert_same_until_parting(got, expected, tol: float = 0.08, typical: float =
     assert median <= typical, f"decode logits deviate at the median step: rfn {median:.5f}, allowed {typical}"
 
 
-def generate_rows(model, cache, tok, jobs: list, max_batch_size: int) -> list:
-    """Greedy decode of [(prompt, lora)] as concurrent jobs, each naming its adapter: per job (tokens, [per-step
-    logits], prompt tokens taken from the cache)"""
-    from exllamav3 import Generator, Job, ArgmaxSampler
-    with torch.inference_mode():
-        gen = Generator(model = model, cache = cache, tokenizer = tok, max_batch_size = max_batch_size)
-        return generate_rows_on(gen, tok, jobs)
-
-
 def generate_rows_on(gen, tok, jobs: list) -> list:
+    """Greedy decode of [(prompt, lora)] as concurrent jobs of a generator, each naming its adapter: per job
+    (tokens, [per-step logits], prompt tokens taken from the cache)"""
     from exllamav3 import Job, ArgmaxSampler
     from exllamav3.constants import PAGE_SIZE
     js = [
@@ -322,3 +315,40 @@ def late_enable_scenario(model_dir: str) -> dict:
     adapter.unload()
     unload_model(model)
     return counts
+
+
+@pytest.mark.models("dense")
+def test_every_token_of_a_row_runs_with_the_rows_adapter(model_id, model_dir, device):
+    """Rows of several tokens (a batch verifying draft tokens) through a gated MLP's stage: each token with its
+    own row's adapter, as the python path gives it, on the eager first call, the capture and the replay"""
+    errors, effect = run_isolated(multi_token_rows_scenario, model_dir, env = device_env(device), timeout = 900.0)
+    assert effect > 0.1, f"{model_id}: swapping the rows' adapters barely changes the output ({effect:.4f}); vacuous"
+    assert max(errors) < 0.02, f"{model_id}: the stage deviates from the python path: {errors}"
+
+
+def multi_token_rows_scenario(model_dir: str) -> tuple:
+    from exllamav3.modules.mlp import GatedMLP
+    _, model, _, _ = load_with_caches(model_dir, get_test_device())
+    model.enable_graph_lora(RANK, 2 * RANK)
+    # Strong adapters: on random inputs the rows' adapters must show in one module's output
+    a, b = RandomAdapter(model, 1, scale = 0.25), RandomAdapter(model, 2, rank = RANK // 2, scale = 0.25)
+    mlp = next(m for m in model if isinstance(m, GatedMLP) and m.lora_statics is not None)
+    gen = torch.Generator().manual_seed(7)
+
+    def rel(x, y):
+        return ((x.float() - y.float()).norm() / y.float().norm()).item()
+
+    errors = []
+    with torch.inference_mode():
+        for rows, tokens in (([a, None, b], 2), ([b, a], 3), ([a, b, b, None], 2)):
+            x = torch.randn(len(rows), tokens, mlp.hidden_size, generator = gen).half().to(mlp.device)
+            bc, mlp.bc = mlp.bc, None       # no graphs: the Linears' own path
+            python = mlp.forward(x.clone(), {"lora_rows": rows}).clone()
+            swapped = mlp.forward(x.clone(), {"lora_rows": rows[::-1]}).clone()
+            mlp.bc = bc
+            for _ in range(3):
+                errors.append(rel(mlp.forward(x.clone(), {"lora_rows": rows}), python))
+        effect = rel(swapped, python)
+    assert model.lora_slots.declined == 0, "the stage declined forwards it should hold"
+    unload_model(model)
+    return errors, effect

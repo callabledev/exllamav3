@@ -58,9 +58,17 @@ class LoraTensors(dict):
     setdefault = _counting("setdefault")
 
 
+class _AllLoras:
+    def __repr__(self):
+        return "ALL_LORAS"
+
+    def __reduce__(self):
+        return "ALL_LORAS"      # pickles as this module's own, so it stays the one object
+
+
 # A row, or a job, that runs with every adapter loaded on the model, which is what a forward does when nothing names
-# its rows' adapters (params["lora_rows"])
-ALL_LORAS = "all"
+# its rows' adapters (params["lora_rows"]). Its own object: no value an adapter could be registered under
+ALL_LORAS = _AllLoras()
 
 
 def lora_rows_of(params: dict | None, rows: int) -> list | None:
@@ -79,14 +87,16 @@ def lora_rows_of(params: dict | None, rows: int) -> list | None:
 
 def lora_rows_for_tokens(params: dict | None, tokens, rows: int) -> dict | None:
     """
-    params for a forward over some of the token rows of a forward over `rows` of them, picked by index (what a
-    block-sparse MLP hands each expert): each picked token becomes a batch row with its own row's adapter, since
-    they no longer divide among the batch rows in order.
+    params for a forward over some of the token rows of a forward over `rows` of them, picked by index (a list or
+    a tensor; what a block-sparse MLP hands each expert): each picked token becomes a batch row with its own row's
+    adapter, since they no longer divide among the batch rows in order.
     """
     lora_rows = lora_rows_of(params, rows)
     if lora_rows is None:
         return params
     per_row = rows // len(lora_rows)
+    if isinstance(tokens, torch.Tensor):
+        tokens = tokens.tolist()    # only now: it waits for the device
     return {**params, "lora_rows": [lora_rows[int(t) // per_row] for t in tokens]}
 
 
@@ -177,6 +187,8 @@ class LoraSlots:
     def refresh(self):
         """Bring the columns up to date with the adapters on the Linears"""
         generation = _lora_generation
+        # A module that was loaded again or unloaded by itself has dropped its stage
+        self.stages = [stage for stage in self.stages if stage.lora_slots is self and stage.lora_statics is not None]
         loaded = self.loaded()
         for lora in list(self.placed):
             if lora not in loaded:

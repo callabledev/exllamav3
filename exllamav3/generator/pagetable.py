@@ -50,23 +50,34 @@ def lora_cache_salt(lora) -> bytes | None:
     model, and with ALL_LORAS, where the caller answers for what is loaded, as before adapters could be named.
 
     An adapter's `cache_key` (bytes or str), if it has one, stands for its weights: its pages outlive the adapter
-    object and serve any adapter with the same key. Without one each adapter object gets a key of its own (a
-    plain value the tensors are registered under, such as a name, is its own key). Either way the salt doesn't
-    see the weights: after putting other tensors under the same adapter, give it another `cache_key`, or what was
-    cached with the old weights serves the new.
+    object and serve any adapter with the same key. Without one each adapter object gets a key of its own, never
+    another object's, also after it is gone (a str, bytes or int the tensors are registered under, such as a
+    name, is its own key). Either way the salt doesn't see the weights: after putting other tensors under the same
+    adapter, give it another `cache_key`, or what was cached with the old weights serves the new.
     """
     if lora is None or lora is ALL_LORAS:
         return None
     key = getattr(lora, "cache_key", None)
     if key is None:
-        try:
-            key = _lora_object_keys.get(lora)
-            if key is None:
-                key = b"adapter object %d" % next(_lora_object_count)
-                _lora_object_keys[lora] = key
-        except TypeError:
-            # No weak references to it: a str, a tuple, a number
+        if isinstance(lora, (str, bytes, int)):
             key = f"adapter value {type(lora).__name__} {lora!r}"
+        else:
+            try:
+                key = _lora_object_keys.get(lora)
+                if key is None:
+                    key = b"adapter object %d" % next(_lora_object_count)
+                    _lora_object_keys[lora] = key
+            except TypeError:
+                # No weak reference to it (__slots__, unhashable): the key goes on the object itself. Nothing
+                # derived from it would do, since its address can be another adapter's later
+                key = b"adapter object %d" % next(_lora_object_count)
+                try:
+                    lora.cache_key = key
+                except AttributeError:
+                    raise TypeError(
+                        f"{type(lora).__name__} takes neither a weak reference nor a cache_key attribute: give "
+                        f"the adapter a cache_key naming its weights"
+                    ) from None
     if isinstance(key, str):
         key = key.encode("utf8")
     return hashlib.blake2b(key, digest_size = 16).digest()

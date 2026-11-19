@@ -135,72 +135,78 @@ class LoRA:
         skipped_keys = []
         tp_skipped = []
 
-        for key, tensor in raw_tensors.items():
-            # Skip non-LoRA keys (e.g. modules_to_save, original_module)
-            if ".lora_A." not in key and ".lora_B." not in key:
-                continue
+        try:
+            for key, tensor in raw_tensors.items():
+                # Skip non-LoRA keys (e.g. modules_to_save, original_module)
+                if ".lora_A." not in key and ".lora_B." not in key:
+                    continue
 
-            # Extract full path and lora half from PEFT key
-            full_path, lora_half = self._parse_key(key)
-            if full_path is None:
-                skipped_keys.append(key)
-                continue
+                # Extract full path and lora half from PEFT key
+                full_path, lora_half = self._parse_key(key)
+                if full_path is None:
+                    skipped_keys.append(key)
+                    continue
 
-            # Match against model modules by suffix to handle any
-            # PEFT key prefix (base_model.model.*, etc.)
-            target = None
-            module_key = None
-            path_parts = full_path.split(".")
-            for start in range(len(path_parts)):
-                candidate = ".".join(path_parts[start:])
-                t = model.modules_dict.get(candidate)
-                if t is not None and isinstance(t, Linear):
-                    target = t
-                    module_key = candidate
-                    break
+                # Match against model modules by suffix to handle any
+                # PEFT key prefix (base_model.model.*, etc.)
+                target = None
+                module_key = None
+                path_parts = full_path.split(".")
+                for start in range(len(path_parts)):
+                    candidate = ".".join(path_parts[start:])
+                    t = model.modules_dict.get(candidate)
+                    if t is not None and isinstance(t, Linear):
+                        target = t
+                        module_key = candidate
+                        break
 
-            if target is None:
-                skipped_keys.append(key)
-                continue
+                if target is None:
+                    skipped_keys.append(key)
+                    continue
 
-            # Tensor-parallel sliced modules not supported
-            if target.is_sliced:
-                tp_skipped.append(key)
-                continue
+                # Tensor-parallel sliced modules not supported
+                if target.is_sliced:
+                    tp_skipped.append(key)
+                    continue
 
-            if tensor.dtype in (torch.bfloat16, torch.float32):
-                tensor = tensor.to(torch.float16)
+                if tensor.dtype in (torch.bfloat16, torch.float32):
+                    tensor = tensor.to(torch.float16)
 
-            # Transpose for efficient matmul: x @ A @ B
-            # PEFT stores lora_A as [rank, in_features] and
-            # lora_B as [out_features, rank].
-            # We want A as [in_features, rank] and B as [rank, out_features].
-            tensor = tensor.T.contiguous()
+                # Transpose for efficient matmul: x @ A @ B
+                # PEFT stores lora_A as [rank, in_features] and
+                # lora_B as [out_features, rank].
+                # We want A as [in_features, rank] and B as [rank, out_features].
+                tensor = tensor.T.contiguous()
 
-            # Pre-scale B matrix
-            if lora_half == "lora_B" and self.lora_scaling != 1.0:
-                tensor.mul_(self.lora_scaling)
+                # Pre-scale B matrix
+                if lora_half == "lora_B" and self.lora_scaling != 1.0:
+                    tensor.mul_(self.lora_scaling)
 
-            # Pad to match target dimensions (quantized layers may pad features to multiples of block size)
-            if lora_half == "lora_A" and tensor.shape[0] < target.in_features:
-                padded = torch.zeros(target.in_features, tensor.shape[1], dtype=tensor.dtype)
-                padded[:tensor.shape[0]] = tensor
-                tensor = padded
-            elif lora_half == "lora_B" and tensor.shape[1] < target.out_features:
-                padded = torch.zeros(tensor.shape[0], target.out_features, dtype=tensor.dtype)
-                padded[:, :tensor.shape[1]] = tensor
-                tensor = padded
+                # Pad to match target dimensions (quantized layers may pad features to multiples of block size)
+                if lora_half == "lora_A" and tensor.shape[0] < target.in_features:
+                    padded = torch.zeros(target.in_features, tensor.shape[1], dtype=tensor.dtype)
+                    padded[:tensor.shape[0]] = tensor
+                    tensor = padded
+                elif lora_half == "lora_B" and tensor.shape[1] < target.out_features:
+                    padded = torch.zeros(tensor.shape[0], target.out_features, dtype=tensor.dtype)
+                    padded[:, :tensor.shape[1]] = tensor
+                    tensor = padded
 
-            tensor = tensor.to(target.device)
+                tensor = tensor.to(target.device)
 
-            # Register on target module
-            if lora_half == "lora_A":
-                target.lora_a_tensors[self] = tensor
-            else:
-                target.lora_b_tensors[self] = tensor
+                # Register on target module
+                if lora_half == "lora_A":
+                    target.lora_a_tensors[self] = tensor
+                else:
+                    target.lora_b_tensors[self] = tensor
 
-            self.target_modules[module_key] = target
-            loaded += 1
+                self.target_modules[module_key] = target
+                loaded += 1
+        except BaseException:
+            # Nothing may stay behind on the model: the caller gets no adapter to unload, and its tensors would
+            # go on applying to every row that names none, and holding columns of the graph LoRA stages
+            self.unload()
+            raise
 
         model.sync_graph_lora()
         print(
